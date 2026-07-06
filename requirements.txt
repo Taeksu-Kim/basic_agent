@@ -1,0 +1,11 @@
+# runtime
+langgraph>=1.0
+
+# optional providers (lazily imported; install what you use)
+#   OpenAICompatLLM (vLLM) needs: requests
+#   AnthropicLLM         needs: anthropic
+requests
+
+# dev / tests
+pytest
+pytest-asyncio
