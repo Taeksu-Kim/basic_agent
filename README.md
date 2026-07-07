@@ -7,7 +7,7 @@ organised around **two agent types that share one substrate**, so they compose
 | type | package | paradigm | when |
 |---|---|---|---|
 | **Plan-and-Execute** | `plan_execute/` | orchestrated: plan a task DAG, execute, replan | structured / decomposable / parallelisable |
-| **ReAct** | `react/` *(planned)* | reactive: LLM directs itself step by step | open-ended / unpredictable |
+| **ReAct** | `react/` | reactive: LLM directs itself step by step | open-ended / unpredictable |
 
 Shared substrate lives in `core/`: `core/llm.py` (LLM abstraction) and
 `core/tools.py` (tools + registry).
@@ -52,6 +52,19 @@ planning rounds (`max_iterations`) and **early-aborts** a plan if any task error
 (remaining levels are skipped and the joiner decides). On replan the result
 namespace is reset for the new plan.
 
+## `react` — pattern
+
+A single reactive loop: `reason` (the LLM picks the next action from the
+trajectory: call a tool, or finish) ↔ `act` (run the tool, append the
+observation to the scratchpad). It ends on `finish` or a `max_steps` cap. Unlike
+`plan_execute`, tool errors are **not** aborted -- they are fed back as
+observations so the agent can react to them. No upfront plan; adaptivity comes
+from the loop itself.
+
+```
+START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (finish / max_steps)
+```
+
 ## Layout
 
 | file | role |
@@ -64,8 +77,10 @@ namespace is reset for the new plan.
 | `plan_execute/executor.py` | *(do)* run one resolved task against the registry |
 | `plan_execute/state.py` | `AgentState` + `results` merge reducer |
 | `plan_execute/graph.py` | assembles the StateGraph; `build_graph`, `arun` |
-| `react/` | *(planned)* reactive tool-calling loop |
-| `run.py` | CLI entrypoint (`--demo` runs offline) |
+| `react/state.py` | `ReactState` + scratchpad append reducer |
+| `react/policy.py` | reasoning step: trajectory → next action (tool / finish) |
+| `react/graph.py` | reason↔act loop; `build_react_agent`, `arun` |
+| `run.py` | CLI entrypoint (`--type plan\|react`, `--demo` runs offline) |
 
 ## LLM / inference
 
@@ -80,10 +95,11 @@ pass a JSON schema to `complete(...)`, which `OpenAICompatLLM` forwards as
 
 ```bash
 conda activate stock-dataset
-python -m agent.run --demo                    # offline smoke test (FakeLLM)
-python -m agent.run "your task" \
+python -m agent.run --demo --type plan         # offline smoke test (FakeLLM)
+python -m agent.run --demo --type react
+python -m agent.run "your task" --type react \
     --base-url http://localhost:8000/v1 --model <served-model>   # real vLLM
-python -m pytest agent/tests -q               # 54 tests
+python -m pytest agent/tests -q                # 67 tests
 ```
 
 ## Tools & sub-agents
