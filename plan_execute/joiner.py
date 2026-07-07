@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 from agent.llm import LLMClient
-from agent.plan import PlanError
+from agent.plan_execute.dag import PlanError
 
 JOINER_SYSTEM = (
     "You are the joiner in a plan-and-execute agent. Given the user's task and "

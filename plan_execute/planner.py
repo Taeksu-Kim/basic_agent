@@ -13,7 +13,7 @@ import re
 from typing import Any, Optional
 
 from agent.llm import LLMClient
-from agent.plan import Plan, PlanError, topological_levels, validate_plan
+from agent.plan_execute.dag import Plan, PlanError, topological_levels, validate_plan
 from agent.tools import ToolRegistry
 
 PLANNER_SYSTEM = (

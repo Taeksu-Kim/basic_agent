@@ -1,11 +1,20 @@
-# Agent — plan-centric orchestrator/executor skeleton
+# Agent — reusable agent skeleton (LangGraph)
 
-A general-purpose **plan-and-execute** agent built on LangGraph. This is a
-reusable skeleton (developed TDD-first); the stock-specific
-*news → price-reaction prediction* agent is built on top of it later by swapping
-in real tools and prompts.
+A general-purpose agent skeleton built on LangGraph, developed TDD-first. It is
+organised around **two agent types that share one substrate**, so they compose
+(either can be wrapped as a tool inside the other):
 
-## Pattern
+| type | package | paradigm | when |
+|---|---|---|---|
+| **Plan-and-Execute** | `plan_execute/` | orchestrated: plan a task DAG, execute, replan | structured / decomposable / parallelisable |
+| **ReAct** | `react/` *(planned)* | reactive: LLM directs itself step by step | open-ended / unpredictable |
+
+Shared substrate: `llm.py` (LLM abstraction) and `tools.py` (tools + registry).
+Both types compile to a graph with the same `ainvoke` contract and are
+`AgentTool`-wrappable. The stock-specific *news → price-reaction prediction*
+agent is built on top of this by swapping in real tools and prompts.
+
+## `plan_execute` — pattern
 
 This is a merge of two standard patterns:
 
@@ -46,14 +55,15 @@ namespace is reset for the new plan.
 
 | file | role |
 |---|---|
-| `plan.py` | `Task`/`Plan`, validation, `topological_levels`, `$N` substitution (pure) |
-| `tools.py` | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — the executable units tasks route to |
-| `llm.py` | `LLMClient` protocol; `FakeLLM` (tests); `OpenAICompatLLM` (vLLM), `AnthropicLLM` |
-| `orchestrator/planner.py` | query → DAG (JSON-schema constrained) + computed levels |
-| `orchestrator/joiner.py` | finish / replan classifier |
-| `executor/executor.py` | run one resolved task against the registry |
-| `state.py` | `AgentState` + `results` merge reducer |
-| `graph.py` | assembles the StateGraph; `build_graph`, `arun` |
+| `llm.py` *(shared)* | `LLMClient` protocol; `FakeLLM` (tests); `OpenAICompatLLM` (vLLM), `AnthropicLLM` |
+| `tools.py` *(shared)* | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — the executable units tasks route to |
+| `plan_execute/dag.py` | `Task`/`Plan`, validation, `topological_levels`, `$N` substitution (pure) |
+| `plan_execute/planner.py` | query → DAG (JSON-schema constrained) + computed levels |
+| `plan_execute/joiner.py` | finish / replan classifier |
+| `plan_execute/executor.py` | run one resolved task against the registry |
+| `plan_execute/state.py` | `AgentState` + `results` merge reducer |
+| `plan_execute/graph.py` | assembles the StateGraph; `build_graph`, `arun` |
+| `react/` | *(planned)* reactive tool-calling loop |
 | `run.py` | CLI entrypoint (`--demo` runs offline) |
 
 ## LLM / inference
@@ -72,7 +82,7 @@ conda activate stock-dataset
 python -m agent.run --demo                    # offline smoke test (FakeLLM)
 python -m agent.run "your task" \
     --base-url http://localhost:8000/v1 --model <served-model>   # real vLLM
-python -m pytest agent/tests -q               # 47 tests
+python -m pytest agent/tests -q               # 54 tests
 ```
 
 ## Tools & sub-agents
@@ -94,4 +104,5 @@ without touching the executor or the graph.
 2. Tailor `PLANNER_SYSTEM` / `JOINER_SYSTEM` prompts to the domain.
 3. Point `OpenAICompatLLM` at the vLLM server and run.
 
-Structural core (`plan.py`, `graph.py`, `state.py`) stays unchanged.
+Structural core (`plan_execute/dag.py`, `plan_execute/graph.py`,
+`plan_execute/state.py`) stays unchanged.
