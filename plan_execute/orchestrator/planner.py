@@ -12,9 +12,9 @@ import json
 import re
 from typing import Any, Optional
 
-from agent.llm import LLMClient
+from agent.core.llm import LLMClient
 from agent.plan_execute.dag import Plan, PlanError, topological_levels, validate_plan
-from agent.tools import ToolRegistry
+from agent.core.tools import ToolRegistry
 
 PLANNER_SYSTEM = (
     "You are the planner in a plan-and-execute agent. Decompose the user's task "

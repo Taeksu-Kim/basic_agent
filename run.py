@@ -15,8 +15,8 @@ import asyncio
 import json
 
 from agent.plan_execute.graph import arun, build_graph
-from agent.llm import FakeLLM, OpenAICompatLLM
-from agent.tools import ToolRegistry
+from agent.core.llm import FakeLLM, OpenAICompatLLM
+from agent.core.tools import ToolRegistry
 
 
 def demo_registry() -> ToolRegistry:

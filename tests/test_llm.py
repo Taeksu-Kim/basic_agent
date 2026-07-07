@@ -1,6 +1,6 @@
 import pytest
 
-from agent.llm import FakeLLM, LLMClient
+from agent.core.llm import FakeLLM, LLMClient
 
 
 def test_fakellm_is_llmclient():

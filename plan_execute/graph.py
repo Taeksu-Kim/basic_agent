@@ -23,11 +23,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from agent.plan_execute.executor import run_task
-from agent.llm import LLMClient
+from agent.core.llm import LLMClient
 from agent.plan_execute.orchestrator import joiner, planner
 from agent.plan_execute.dag import substitute_args
 from agent.plan_execute.state import RESET, AgentState
-from agent.tools import ToolRegistry
+from agent.core.tools import ToolRegistry
 
 
 def _has_error(results: dict[int, Any]) -> bool:

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.tools import ToolRegistry
+from agent.core.tools import ToolRegistry
 
 
 async def run_task(payload: dict[str, Any], registry: ToolRegistry) -> dict[str, Any]:

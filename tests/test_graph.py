@@ -1,7 +1,7 @@
 from agent.plan_execute.graph import arun, build_graph
-from agent.llm import FakeLLM
+from agent.core.llm import FakeLLM
 from agent.plan_execute.state import merge_results
-from agent.tools import AgentTool, ToolRegistry
+from agent.core.tools import AgentTool, ToolRegistry
 
 
 # ---- state reducer ---------------------------------------------------------

@@ -1,6 +1,6 @@
 import pytest
 
-from agent.tools import BaseTool, FunctionTool, ToolError, ToolRegistry
+from agent.core.tools import BaseTool, FunctionTool, ToolError, ToolRegistry
 
 
 async def test_register_and_call_sync_tool():

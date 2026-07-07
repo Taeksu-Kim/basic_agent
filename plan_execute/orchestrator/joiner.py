@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any
 
-from agent.llm import LLMClient
+from agent.core.llm import LLMClient
 from agent.plan_execute.dag import PlanError
 
 JOINER_SYSTEM = (

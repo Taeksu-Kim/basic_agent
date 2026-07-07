@@ -9,7 +9,8 @@ organised around **two agent types that share one substrate**, so they compose
 | **Plan-and-Execute** | `plan_execute/` | orchestrated: plan a task DAG, execute, replan | structured / decomposable / parallelisable |
 | **ReAct** | `react/` *(planned)* | reactive: LLM directs itself step by step | open-ended / unpredictable |
 
-Shared substrate: `llm.py` (LLM abstraction) and `tools.py` (tools + registry).
+Shared substrate lives in `core/`: `core/llm.py` (LLM abstraction) and
+`core/tools.py` (tools + registry).
 Both types compile to a graph with the same `ainvoke` contract and are
 `AgentTool`-wrappable. The stock-specific *news → price-reaction prediction*
 agent is built on top of this by swapping in real tools and prompts.
@@ -55,8 +56,8 @@ namespace is reset for the new plan.
 
 | file | role |
 |---|---|
-| `llm.py` *(shared)* | `LLMClient` protocol; `FakeLLM` (tests); `OpenAICompatLLM` (vLLM), `AnthropicLLM` |
-| `tools.py` *(shared)* | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — the executable units tasks route to |
+| `core/llm.py` *(shared)* | `LLMClient` protocol; `FakeLLM` (tests); `OpenAICompatLLM` (vLLM), `AnthropicLLM` |
+| `core/tools.py` *(shared)* | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — the executable units tasks route to |
 | `plan_execute/dag.py` | `Task`/`Plan`, validation, `topological_levels`, `$N` substitution (pure) |
 | `plan_execute/orchestrator/planner.py` | *(decide)* query → DAG (JSON-schema constrained) + computed levels |
 | `plan_execute/orchestrator/joiner.py` | *(decide)* finish / replan classifier |

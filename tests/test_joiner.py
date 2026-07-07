@@ -1,6 +1,6 @@
 import pytest
 
-from agent.llm import FakeLLM
+from agent.core.llm import FakeLLM
 from agent.plan_execute.orchestrator import joiner
 from agent.plan_execute.dag import PlanError
 
