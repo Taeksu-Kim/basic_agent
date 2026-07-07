@@ -1,7 +1,7 @@
 import pytest
 
 from agent.llm import FakeLLM
-from agent.plan_execute import planner
+from agent.plan_execute.orchestrator import planner
 from agent.plan_execute.dag import PlanError
 from agent.tools import ToolRegistry
 

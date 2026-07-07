@@ -58,9 +58,9 @@ namespace is reset for the new plan.
 | `llm.py` *(shared)* | `LLMClient` protocol; `FakeLLM` (tests); `OpenAICompatLLM` (vLLM), `AnthropicLLM` |
 | `tools.py` *(shared)* | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — the executable units tasks route to |
 | `plan_execute/dag.py` | `Task`/`Plan`, validation, `topological_levels`, `$N` substitution (pure) |
-| `plan_execute/planner.py` | query → DAG (JSON-schema constrained) + computed levels |
-| `plan_execute/joiner.py` | finish / replan classifier |
-| `plan_execute/executor.py` | run one resolved task against the registry |
+| `plan_execute/orchestrator/planner.py` | *(decide)* query → DAG (JSON-schema constrained) + computed levels |
+| `plan_execute/orchestrator/joiner.py` | *(decide)* finish / replan classifier |
+| `plan_execute/executor.py` | *(do)* run one resolved task against the registry |
 | `plan_execute/state.py` | `AgentState` + `results` merge reducer |
 | `plan_execute/graph.py` | assembles the StateGraph; `build_graph`, `arun` |
 | `react/` | *(planned)* reactive tool-calling loop |
