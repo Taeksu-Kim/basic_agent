@@ -1,5 +1,7 @@
 # runtime
 langgraph>=1.0
+langgraph-checkpoint-sqlite  # local HITL state store (core/checkpoint.py)
+aiosqlite                    # async saver -- the graphs run via ainvoke
 
 # optional providers (lazily imported; install what you use)
 #   OpenAICompatLLM (vLLM) needs: requests

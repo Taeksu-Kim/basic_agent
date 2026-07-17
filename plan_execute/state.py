@@ -36,6 +36,8 @@ class AgentState(TypedDict, total=False):
     iteration: int                    # number of planning rounds so far
     # execution
     results: Annotated[dict[int, Any], merge_results]
+    # HITL
+    plan_rejected: bool               # human rejected the plan -> replan
     # joining
     decision: str                     # "finish" | "replan"
     decision_reason: str

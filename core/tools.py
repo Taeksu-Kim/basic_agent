@@ -31,6 +31,7 @@ class BaseTool(ABC):
     name: str = ""
     description: str = ""
     args_schema: Optional[dict] = None
+    requires_approval: bool = False  # HITL: pause for human approval before running
 
     @abstractmethod
     def run(self, **kwargs: Any) -> Any:
@@ -51,10 +52,12 @@ class FunctionTool(BaseTool):
         func: Callable[..., Any],
         description: str = "",
         args_schema: Optional[dict] = None,
+        requires_approval: bool = False,
     ) -> None:
         self.name = name
         self.description = description
         self.args_schema = args_schema
+        self.requires_approval = requires_approval
         self._func = func
 
     def run(self, **kwargs: Any) -> Any:
@@ -119,9 +122,10 @@ class ToolRegistry:
         *,
         description: str = "",
         args_schema: Optional[dict] = None,
+        requires_approval: bool = False,
     ) -> FunctionTool:
         """Wrap and register a plain callable."""
-        tool = FunctionTool(name, func, description, args_schema)
+        tool = FunctionTool(name, func, description, args_schema, requires_approval)
         self.add(tool)
         return tool
 
