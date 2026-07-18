@@ -24,3 +24,28 @@ def test_fakellm_exhausted_raises():
     llm = FakeLLM([])
     with pytest.raises(AssertionError, match="ran out"):
         llm.complete("s", "u")
+
+
+def test_openai_compat_sampling_overrides_in_payload(monkeypatch):
+    from agent.core import llm as llm_mod
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    llm = llm_mod.OpenAICompatLLM(base_url="http://x/v1", model="m",
+                                  sampling={"temperature": 0.2, "frequency_penalty": 0.5})
+    assert llm.complete("s", "u") == "ok"
+    assert captured["temperature"] == 0.2          # 기본 0을 덮어씀
+    assert captured["frequency_penalty"] == 0.5
+    assert captured["max_tokens"] == 1024          # 폭주 방지 기본 상한

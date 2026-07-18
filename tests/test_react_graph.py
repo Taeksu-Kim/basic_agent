@@ -79,3 +79,23 @@ async def test_react_agent_composes_as_tool_in_plan():
 
     assert state["results"][1] == "react-done"  # ReAct sub-agent ran to completion
     assert state["final"] == "plan used $1"
+
+
+async def test_react_agent_as_tool_returns_structured_result():
+    # 리트리버 패턴: react 서브에이전트가 구조화 결과(result)를 내고,
+    # AgentTool(result_key="result")로 부모가 그 구조체를 받는다.
+    llm = FakeLLM.json(
+        {"action": "tool", "tool": "lookup", "args": {"q": "연차"}},
+        {"action": "finish", "final": "요약", "result": {"docs": ["result:연차"]}},
+    )
+    sub = build_react_agent(llm=llm, registry=_reg())
+    tool = AgentTool("retriever", sub, result_key="result")
+    out = await tool.run(query="연차휴가 근거 찾아줘")
+    assert out == {"docs": ["result:연차"]}
+
+
+async def test_build_react_agent_passes_system_prompt():
+    llm = FakeLLM.json({"action": "finish", "final": "ok"})
+    graph = build_react_agent(llm=llm, registry=_reg(), system="도메인 지침이다.")
+    await arun(graph, "q")
+    assert "도메인 지침이다." in llm.calls[0][0]

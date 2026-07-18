@@ -39,3 +39,9 @@ def test_join_node_passes_schema():
     joiner.join({"query": "q", "results": {}}, llm)
     _, _, schema = llm.calls[0]
     assert schema == joiner.DECISION_SCHEMA
+
+
+def test_parse_decision_json_embedded_in_prose():
+    # group(1) 회귀 방지 (react policy와 동일 버그가 joiner에도 있었음)
+    d = joiner.parse_decision('사고 과정...\n{"decision": "finish", "final": "ok"}')
+    assert d["decision"] == "finish"

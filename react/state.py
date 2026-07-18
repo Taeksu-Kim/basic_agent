@@ -22,3 +22,4 @@ class ReactState(TypedDict, total=False):
     iteration: int          # number of reasoning steps taken
     action: dict[str, Any]  # the last decided action
     final: str
+    result: Any             # optional structured payload set on finish

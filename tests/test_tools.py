@@ -102,3 +102,52 @@ def test_add_rejects_nameless_tool():
 
 def test_function_tool_is_basetool():
     assert isinstance(FunctionTool("t", lambda: 1), BaseTool)
+
+
+# ---- AgentTool: multi-arg forwarding (retriever needs filters/as_of etc.) ----
+
+
+class _RecordingGraph:
+    """Fake compiled graph: records the state it was invoked with."""
+
+    def __init__(self, final="ok", extra=None):
+        self.calls = []
+        self._out = {"final": final, **(extra or {})}
+
+    async def ainvoke(self, state):
+        self.calls.append(state)
+        return self._out
+
+
+async def test_agent_tool_forwards_extra_kwargs_into_initial_state():
+    from agent.core.tools import AgentTool
+
+    g = _RecordingGraph()
+    tool = AgentTool("retriever", g)
+    out = await tool.run(query="연차휴가", filters={"law": "근로기준법"}, top_k=5)
+
+    assert out == "ok"
+    state = g.calls[0]
+    assert state["query"] == "연차휴가"
+    assert state["filters"] == {"law": "근로기준법"} and state["top_k"] == 5
+    assert state["history"] == [] and state["iteration"] == 0
+
+
+async def test_agent_tool_extra_kwargs_cannot_override_reserved_keys():
+    from agent.core.tools import AgentTool
+
+    g = _RecordingGraph()
+    tool = AgentTool("sub", g)
+    await tool.run(query="q", history=["fake"], iteration=99)
+
+    state = g.calls[0]
+    assert state["history"] == [] and state["iteration"] == 0  # reserved, not overridden
+
+
+async def test_agent_tool_result_key_extracts_structured_result():
+    from agent.core.tools import AgentTool
+
+    evidence = [{"law": "근로기준법", "clause": "60"}]
+    g = _RecordingGraph(final="done", extra={"result": evidence})
+    tool = AgentTool("retriever", g, result_key="result")
+    assert await tool.run(query="q") == evidence

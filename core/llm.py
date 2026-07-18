@@ -60,11 +60,15 @@ class OpenAICompatLLM:
         model: str = "local",
         api_key: str = "not-needed",
         timeout: float = 120.0,
+        sampling: Optional[dict] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        # max_tokens 기본 상한: 미설정 시 소형 모델의 반복 폭주가 컨텍스트를
+        # 다 먹고 JSON이 중간에 잘리는 사고가 난다 (실측). sampling으로 덮어쓰기.
+        self.sampling = {"temperature": 0, "max_tokens": 1024, **(sampling or {})}
 
     def complete(self, system: str, user: str, *, schema: Optional[dict] = None) -> str:
         import requests  # lazy
@@ -75,7 +79,7 @@ class OpenAICompatLLM:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0,
+            **self.sampling,
         }
         if schema is not None:
             # vLLM guided decoding via OpenAI structured-output form.
@@ -89,7 +93,9 @@ class OpenAICompatLLM:
             json=payload,
             timeout=self.timeout,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # surface the server's reason -- a bare 400 is undebuggable
+            raise RuntimeError(f"LLM HTTP {resp.status_code}: {resp.text[:500]}")
         return resp.json()["choices"][0]["message"]["content"]
 
 

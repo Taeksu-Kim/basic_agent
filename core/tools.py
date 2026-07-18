@@ -72,8 +72,14 @@ class AgentTool(BaseTool):
 
     ``graph`` is any object with an async ``ainvoke(state) -> state`` (e.g. the
     output of :func:`agent.graph.build_graph`). The tool's ``query_arg`` becomes
-    the sub-agent's query; ``result_key`` is pulled from its final state.
+    the sub-agent's query; any *other* kwargs are forwarded into the sub-agent's
+    initial state (so e.g. a retriever sub-agent can take ``filters``/``top_k``),
+    except the reserved run-bookkeeping keys. ``result_key`` is pulled from the
+    final state -- point it at a structured channel (e.g. react's ``result``) to
+    get non-string results out of a sub-agent.
     """
+
+    _RESERVED = ("query", "history", "iteration")
 
     def __init__(
         self,
@@ -98,7 +104,11 @@ class AgentTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> Any:
         query = kwargs[self._query_arg]
-        state = await self._graph.ainvoke({"query": query, "history": [], "iteration": 0})
+        extra = {k: v for k, v in kwargs.items()
+                 if k != self._query_arg and k not in self._RESERVED}
+        state = await self._graph.ainvoke(
+            {**extra, "query": query, "history": [], "iteration": 0}
+        )
         return state.get(self._result_key)
 
 

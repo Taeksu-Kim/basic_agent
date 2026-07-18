@@ -43,9 +43,13 @@ def _needs_approval(registry: ToolRegistry, name: str) -> bool:
 
 
 def build_react_agent(
-    *, llm: LLMClient, registry: ToolRegistry, max_steps: int = 6, checkpointer: Any = None
+    *, llm: LLMClient, registry: ToolRegistry, max_steps: int = 6,
+    checkpointer: Any = None, system: str | None = None
 ) -> Any:
     """Compile a ReAct agent for a given LLM + tool registry.
+
+    ``system`` appends domain guidance to the base ReAct system prompt (e.g. a
+    retriever agent's query-rewriting rules).
 
     Tools registered with ``requires_approval=True`` trigger a HITL gate: the
     graph pauses (``interrupt``) before running them and resumes on a human
@@ -54,7 +58,7 @@ def build_react_agent(
     """
 
     def reason_node(state: ReactState) -> dict[str, Any]:
-        return policy.reason(state, llm, registry)
+        return policy.reason(state, llm, registry, system=system)
 
     async def act_node(state: ReactState) -> dict[str, Any]:
         action = state["action"]

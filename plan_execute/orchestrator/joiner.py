@@ -42,7 +42,7 @@ def _extract_json(text: str) -> Any:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
         raise PlanError(f"no JSON found in joiner output: {text[:200]!r}")
-    return json.loads(m.group(1))
+    return json.loads(m.group(0))
 
 
 def parse_decision(text: str) -> dict[str, Any]:
