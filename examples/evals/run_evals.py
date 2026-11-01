@@ -340,6 +340,15 @@ WF_TASKS = [
 
 SUITES = {"main": TASKS, "lo": LO_TASKS, "wf": WF_TASKS}
 
+
+def _heldout() -> list:
+    from agent.examples.evals.heldout import heldout_tasks
+
+    return heldout_tasks(Task)
+
+
+SUITES["heldout"] = _heldout()
+
 # ------------------------------------------------------------------ conditions
 
 
@@ -443,8 +452,8 @@ async def main_async(args: argparse.Namespace) -> list[RunResult]:
     (out / "traces").mkdir(parents=True, exist_ok=True)
     tasks = [t for t in SUITES[args.suite] if not args.tasks or t.name in args.tasks]
     conds = [c for c in CONDITIONS if not args.conditions or c.name in args.conditions]
-    if args.suite == "wf":  # each workflow task builds its own pattern -> one run per task
-        conds = [Condition("workflow", "-")]
+    if args.suite in ("wf", "heldout"):  # each task builds its own pattern -> one run per task
+        conds = [Condition("custom", "-")]
     results = []
     for task in tasks:
         for cond in conds:

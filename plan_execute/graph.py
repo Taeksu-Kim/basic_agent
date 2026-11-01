@@ -204,7 +204,7 @@ def build_graph(
             task = by_id[tid]
             try:
                 args = substitute_args(task.get("args", {}), results)
-            except PlanError as exc:  # e.g. $1.price_usd but task 1 returned text -> task fails
+            except PlanError as exc:  # e.g. $1.total but task 1 returned text -> task fails
                 sends.append(Send("run_task", {"id": tid, "tool": task["tool"],
                                                "arg_error": str(exc)}))
                 continue

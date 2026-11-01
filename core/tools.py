@@ -107,7 +107,7 @@ class AgentTool(BaseTool):
 
         ``output_schema``: ask the sub-agent to finish with a structured ``result`` of
         this shape and return that object (planners see it as ``returns`` and can
-        reference fields: ``$1.price_usd``). If the sub-agent doesn't produce a
+        reference fields: ``$1.total``). If the sub-agent doesn't produce a
         matching ``result``, the call comes back as a failure -- never as free text
         silently standing in for a number.
         """

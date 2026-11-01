@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-# $N, optionally followed by a path into the result: $3.price_usd, $2.items[0].name
+# $N, optionally followed by a path into the result: $3.total, $2.items[0].name
 _REF_RE = re.compile(r"\$(\d+)((?:\.[A-Za-z_]\w*|\[\d+\])*)")
 _PATH_RE = re.compile(r"\.([A-Za-z_]\w*)|\[(\d+)\]")
 
