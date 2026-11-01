@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — `feat/any-llm-adapter` (2026-11-01)
+### Added
+- `AnyLLMClient` (mozilla-ai any-llm, 선택 의존성 `any-llm-sdk==1.37.0` 고정): `structured=auto|native|prompt`,
+  `extra_body`, 토큰 사용량, 컨텍스트 초과 → `ContextOverflowError`. CLI `--provider`, `--extra-body`
+- `examples/llm_adapter_check.py`: 실제 호출 없이 SDK 경로 + 가짜 HTTP로 제공자 3종(vLLM 호환, OpenAI, Anthropic) 점검 (17/17)
+### Changed
+- 스키마의 `const`/`enum`에 `"type": "string"` 명시 (react 행동, joiner, router, orchestrator). 의미는 같고,
+  `type` 없는 `const`를 Anthropic SDK가 거부하던 문제를 피함. **실제 vLLM guided decoding에서는 아직 재확인 안 함**
+
 ## Unreleased — `feat/pattern-standardization` (2026-11-01)
 
 검증: FakeLLM 조합 행렬 111/111 (`examples/compose_matrix.py`), 실모델 Qwen3.8-27B-INT4 평가

@@ -189,6 +189,27 @@ START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (
 `response_format: {type: json_schema}`(vLLM guided decoding)로 전달해 유효한 JSON을
 받습니다.
 
+### 여러 제공자: `AnyLLMClient` (any-llm, 선택 의존성)
+
+```python
+from agent.core.llm import AnyLLMClient
+llm = AnyLLMClient("anthropic", "claude-sonnet-5")                       # 키는 ANTHROPIC_API_KEY
+llm = AnyLLMClient("openai_compatible", "qwen3.8-27b-redhat-int4",        # vLLM
+                   api_base="http://<IP>:8002/v1",
+                   extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+```
+CLI: `python -m agent.run "task" --provider anthropic --model <id>`.
+
+`structured`가 스키마를 어떻게 강제할지 정합니다: `native`(제공자의 구조화 출력, vLLM이면 guided decoding) /
+`prompt`(스키마를 시스템 프롬프트에 적고 패턴의 재시도에 맡김) / `auto`(기본: Anthropic 계열은 `prompt`, 나머지는 `native`).
+Anthropic 계열이 `prompt`인 이유: Anthropic SDK의 스키마 변환이 자유 형식 객체(`args`, `result`)를
+"비어 있어야 하는 객체"로 바꾸고 `const`를 설명 문자열로 옮겨서, native로는 인자 있는 도구 호출이 불가능하기
+때문입니다 (any-llm 1.37.0, 오프라인 확인).
+
+호출 없이 어댑터를 점검: `python -m agent.examples.llm_adapter_check` — 제공자별 SDK 경로를 실제로 타되 HTTP만
+가짜로 바꿔, 스키마 전달·추가 필드·토큰 사용량·컨텍스트 초과 변환·react/plan_execute 종단 실행을 확인합니다.
+**모델 품질이나 실제 서버의 수용 여부는 확인하지 않습니다.**
+
 > 그래프 전체가 테스트에서 `FakeLLM`으로 실행됩니다 — **테스트 스위트에는 실제
 > 모델 호출도 네트워크도 없습니다.**
 

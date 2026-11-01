@@ -35,12 +35,12 @@ DECISION_SCHEMA: dict[str, Any] = {
     "anyOf": [
         {
             "type": "object",
-            "properties": {"decision": {"const": "finish"}, "final": {"type": "string"}},
+            "properties": {"decision": {"type": "string", "const": "finish"}, "final": {"type": "string"}},
             "required": ["decision", "final"],
         },
         {
             "type": "object",
-            "properties": {"decision": {"const": "replan"}, "reason": {"type": "string"}},
+            "properties": {"decision": {"type": "string", "const": "replan"}, "reason": {"type": "string"}},
             "required": ["decision", "reason"],
         },
     ]

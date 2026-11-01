@@ -149,12 +149,15 @@ async def _amain(
     demo_hitl: bool = False,
     trace_dir: str | None = None,
     sampling: dict | None = None,
+    provider: str | None = None,
+    extra_body: dict | None = None,
 ) -> None:
     tracer = Tracer(Path(trace_dir) / f"{uuid.uuid4().hex[:8]}.jsonl") if trace_dir else None
     with tracing(tracer):
         await _run(query, agent_type=agent_type, demo=demo, base_url=base_url, model=model,
                    approve_plans=approve_plans, approve_levels=approve_levels,
-                   state_path=state_path, demo_hitl=demo_hitl, sampling=sampling)
+                   state_path=state_path, demo_hitl=demo_hitl, sampling=sampling,
+                   provider=provider, extra_body=extra_body)
     if tracer is not None:
         print(f"trace: {tracer.path}")
 
@@ -171,6 +174,8 @@ async def _run(
     state_path: str | None,
     demo_hitl: bool,
     sampling: dict | None = None,
+    provider: str | None = None,
+    extra_body: dict | None = None,
 ) -> None:
     spec = patterns.get(agent_type)  # aliases (e.g. "plan") resolve here
     registry = demo_registry()  # replace with real tools per application
@@ -186,6 +191,11 @@ async def _run(
         llm = _demo_hitl_llm(spec.name)
     elif demo:
         llm = _demo_llm(spec.name)
+    elif provider:
+        from agent.core.llm import AnyLLMClient
+
+        llm = AnyLLMClient(provider, model, sampling=sampling, extra_body=extra_body,
+                           api_base=base_url if provider == "openai_compatible" else None)
     else:
         llm = OpenAICompatLLM(base_url=base_url, model=model, sampling=sampling)
 
@@ -269,6 +279,11 @@ def main() -> None:
     ap.add_argument("--demo", action="store_true", help="run offline with a FakeLLM")
     ap.add_argument("--base-url", default="http://localhost:8000/v1", help="vLLM endpoint")
     ap.add_argument("--model", default="local", help="model name served by vLLM")
+    ap.add_argument("--provider", default=None,
+                    help="use AnyLLMClient (any-llm) with this provider id, e.g. anthropic, openai, "
+                         "openai_compatible (uses --base-url). Default: built-in OpenAI-compatible client")
+    ap.add_argument("--extra-body", default=None, metavar="JSON",
+                    help="raw request body fields for --provider (e.g. chat_template_kwargs for vLLM)")
     ap.add_argument("--sampling", default=None, metavar="JSON",
                     help='extra request fields merged into every LLM call, e.g. '
                          '\'{"chat_template_kwargs": {"enable_thinking": false}}\' (Qwen3 thinking off)')
@@ -296,6 +311,8 @@ def main() -> None:
             demo_hitl=args.demo_hitl,
             trace_dir=args.trace,
             sampling=json.loads(args.sampling) if args.sampling else None,
+            provider=args.provider,
+            extra_body=json.loads(args.extra_body) if args.extra_body else None,
         )
     )
 
