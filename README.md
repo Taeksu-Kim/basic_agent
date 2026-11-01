@@ -1,19 +1,12 @@
 # Agent — 재사용 가능한 에이전트 골격 (LangGraph)
 
-LangGraph 기반 범용 에이전트 골격. TDD로 작성했습니다. **하나의 substrate를
-공유하는 두 개의 에이전트 타입**으로 구성돼 있어, 서로 조합(compose)됩니다
-(한쪽을 다른 쪽의 tool로 감쌀 수 있음):
+LangGraph 기반 범용 에이전트 골격입니다. 업계 표준 명칭으로 등록된 **7개 패턴**이 하나의 공통
+계약과 하나의 도구 실행 경로를 공유하므로, 어떤 패턴이든 다른 패턴 안에 넣을 수 있습니다
+(서브에이전트를 `AgentTool`로 감싸 도구로 등록).
 
-| 타입 | 패키지 | 패러다임 | 적합한 경우 |
-|---|---|---|---|
-| **Plan-and-Execute** | `plan_execute/` | orchestrated: task DAG를 계획 → 실행 → 리플랜 | 구조적 / 분해 가능 / 병렬화 가능 |
-| **ReAct** | `react/` | reactive: LLM이 스스로 한 스텝씩 진행 | 오픈엔드 / 예측 불가 |
-
-공유 substrate는 `core/`에 있습니다: `core/llm.py`(LLM 추상화)와
-`core/tools.py`(tool + registry). 두 타입 모두 동일한 `ainvoke` 계약을 가진
-그래프로 컴파일되고 `AgentTool`로 감쌀 수 있습니다. 주식 도메인의
-*뉴스 → 주가 반응 예측* 에이전트는 이 위에 실제 tool과 프롬프트를 끼워 넣어
-만듭니다.
+- 공유 기반 `core/`: LLM 클라이언트, 도구·등록부, 공통 계약, 도구 실행 경로(승인·실패·interrupt·읽기 전용),
+  HITL, 컨텍스트 관리, 실행 기록
+- 검증: FakeLLM 조합 행렬(`examples/compose_matrix.py`)과 실모델 평가(`examples/evals/`). 수치는 `docs/baseline.md`
 
 패턴은 **표준 명칭으로 등록부에 등록**되어 있습니다 (`python -m agent.run --list-patterns`).
 패턴별 업계 표준 명칭·출처·조합 규칙은 [`docs/PATTERNS.md`](docs/PATTERNS.md)에 있습니다.
@@ -40,15 +33,15 @@ from agent.patterns import registry as patterns
 tools = ToolRegistry()
 tools.add(AgentTool("researcher", patterns.get("react").build(llm=llm, registry=search_tools),
                     description="looks things up", read_only=True,
-                    output_schema={"type": "object", "properties": {"price_usd": {"type": "number"}},
-                                   "required": ["price_usd"]}))
-router = patterns.get("router").build(llm=llm, registry=tools, routes={"researcher": "price questions"})
+                    output_schema={"type": "object", "properties": {"total": {"type": "number"}},
+                                   "required": ["total"]}))
+router = patterns.get("router").build(llm=llm, registry=tools, routes={"researcher": "lookup questions"})
 ```
 
 `AgentTool` 옵션:
 - `read_only=True`: 자식(과 그 자식) 안에서 `writes=True` 도구를 거절 (single writer)
 - `output_schema={...}`: 자식에게 그 형태의 `result`를 요청하고 그 객체를 반환. planner는 `returns:`를 보고
-  `$1.price_usd`로 필드를 참조. 형태가 맞지 않으면 실패로 반환 (문장이 숫자 자리에 들어가지 않음)
+  `$1.total`처럼 필드를 참조. 형태가 맞지 않으면 실패로 반환 (문장이 숫자 자리에 들어가지 않음)
 - 호출 인자 `context=...`: 자식 프롬프트에 "Context from the caller"로 전달
 
 ## 공통 계약 (`core/contract.py`) — 패턴이 서로 끼워지는 이유
@@ -83,7 +76,9 @@ graph = patterns.get("plan").build(llm=llm, registry=tools, checkpointer=saver) 
 `DEFAULT_REACT_POLICY = ContextPolicy(offload=True)`** 입니다 — 실모델 평가에서 잘라내기만 하면
 미리보기 밖의 답을 읽지 않고 "없다"고 단정하거나 지어냈기 때문입니다 (`docs/baseline.md`).
 `context_policy=None`이면 원래 프롬프트(1,500자 잘라내기, 읽기 도구 없음)입니다.
-plan_execute는 기본이 `None`(결과 전체 표시)이고, 프롬프트가 컨텍스트를 넘으면 결과를 잘라 한 번 재시도합니다. 효과는 모델에 따라 다르므로 기본값은 모두 꺼져 있습니다.
+plan_execute는 기본이 `None`(결과 전체 표시)이고, 프롬프트가 컨텍스트를 넘으면 결과를 잘라 한 번 재시도합니다.
+react의 offload를 제외한 나머지 옵션(clearing, compaction, notes, skills, tool search)은 효과가 모델에 따라 달라
+기본으로 꺼져 있습니다 (실모델 검증 전).
 
 | 옵션 | 기능 (표준 명칭) | 적용 |
 |---|---|---|
@@ -117,11 +112,18 @@ intent classifier 없음 — planner가 흡수). 라우팅은 **정적**: 각 ta
 필드가 바인딩입니다.
 
 ```
-START ─▶ plan ─(dispatch)─▶ run_task* ─▶ advance ─(dispatch)─▶ … ─▶ join
-                                                                     │
-                            finish / cap ◀──(route_join)─────────────┤
-                            replan ───────────────────────────────────┘  (→ plan)
+START ─▶ plan ─▶ [approve] ─▶ level_gate ─(dispatch)─▶ run_task* ─▶ advance ─▶ level_gate ─▶ … ─▶ join
+           │                                                                                      │
+           └─ 출력 계속 불량 → END (status=error)        finish / cap / error ◀──(route_join)────────┤
+                                                         replan ─────────────────────────────────────┘ (→ plan)
 ```
+
+- `level_gate`: 레벨을 내보내기 **전에** 그 레벨의 승인 필요 task를 모아 한 번 멈춤 (HITL 절 참조)
+- planner·joiner 출력이 깨지면 에러 내용을 넣어 재시도, 그래도 안 되면 `status=error`로 종료 (실행이 죽지 않음)
+- 등록되지 않은 도구를 쓴 계획은 실행 전에 거부하고 다시 계획
+- `$N.field` / `$N[0]`로 결과의 일부를 참조. 참조가 풀리지 않으면 그 task만 실패
+- 프롬프트가 컨텍스트를 넘으면 결과를 잘라 한 번 재시도 (`ContextOverflowError`)
+- 재계획 상한에 도달한 마지막 라운드의 joiner는 스키마로 `finish`만 허용 → 상한에 걸려도 답을 냄
 
 ### 플랜은 DAG, 실행은 레벨 동기화
 
@@ -136,8 +138,10 @@ executor를 eager dispatch로 승격할 수 있습니다.
 
 LLMCompiler 방식: **joiner**가 플랜 전체 실행 후 한 번 돌며 `finish`(최종 답변)
 또는 `replan`(이유)을 반환합니다. 그래프는 계획 라운드를 상한(`max_iterations`)으로
-막고, task가 하나라도 에러나면 플랜을 **early-abort**합니다(남은 레벨은 건너뛰고
-joiner가 판단). 리플랜 시 결과 네임스페이스는 새 플랜을 위해 리셋됩니다.
+막고, **앞 레벨에서** task가 실패하면 이후 레벨을 건너뛰고 joiner가 판단합니다(early-abort).
+같은 레벨의 형제 task는 서로 독립이므로 실행됩니다. 실패는 명시적 표식(`__failure__`)으로만
+판정하므로, 정상 데이터에 `error` 필드가 있어도 실패로 보지 않습니다. 리플랜 시 결과
+네임스페이스는 새 플랜을 위해 리셋됩니다.
 
 ## `react` — 패턴
 
@@ -159,7 +163,7 @@ START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (
 
 | 파일 | 역할 |
 |---|---|
-| `core/llm.py` *(공유)* | `LLMClient` 프로토콜; `FakeLLM`(테스트); `OpenAICompatLLM`(vLLM), `AnthropicLLM` |
+| `core/llm.py` *(공유)* | `LLMClient` 프로토콜; `FakeLLM`(테스트); `OpenAICompatLLM`(vLLM), `AnthropicLLM`, `AnyLLMClient`(any-llm, 선택); `ContextOverflowError` |
 | `core/tools.py` *(공유)* | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — task가 라우팅되는 실행 단위 |
 | `plan_execute/dag.py` | `Task`/`Plan`, 검증, `topological_levels`, `$N` 치환 (순수) |
 | `plan_execute/orchestrator/planner.py` | *(판단)* query → DAG (JSON 스키마 강제) + 레벨 계산 |
@@ -179,8 +183,11 @@ START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (
 | `patterns/registry.py` | 패턴 등록부 (`PatternSpec`: 표준 명칭·빌더·메타데이터), `patterns/builtin.py`에서 7종 등록 |
 | `patterns/workflows.py` | 워크플로 패턴 5종 (prompt_chain, router, parallel, evaluator_optimizer, orchestrator_workers) |
 | `run.py` | CLI 엔트리포인트 (`--type <패턴 또는 별칭>`, `--list-patterns`, `--demo`는 오프라인, `--trace DIR`) |
-| `examples/compose_matrix.py` | 조합 행렬: 등록된 모든 (부모, 자식) 패턴 쌍 × HITL·실패·계약 시나리오를 E2E 검증 |
-| `docs/` | `PATTERNS.md`(용어·표준 명칭), `WORKPLAN.md`(작업 계획), `baseline.md`(검증 기록) |
+| `examples/compose_matrix.py` | 조합 행렬: 등록된 모든 (부모, 자식) 패턴 쌍 × HITL·실패·계약·컨텍스트 시나리오를 E2E 검증 (FakeLLM) |
+| `examples/evals/` | 실모델 평가: `run_evals.py` (main / lo / wf), `heldout.py` (실행 전 고정한 홀드아웃) |
+| `examples/llm_adapter_check.py` | LLM 어댑터 오프라인 점검 (SDK 경로 + 가짜 HTTP, 모델·네트워크 없음) |
+| `docs/` | `PATTERNS.md`(분류·용어·출처), `WORKPLAN.md`(계획·결정 기록), `baseline.md`(검증 기록), `MIGRATION.md`(사본 이전) |
+| `CHANGELOG.md` | 변경 내역 |
 
 ## LLM / 추론
 
@@ -228,8 +235,9 @@ python -m agent.examples.compose_matrix        # 조합 행렬 (FakeLLM, 표 출
 python -m agent.examples.evals.run_evals --base-url http://<IP>:8002/v1 \
     --model qwen3.8-27b-redhat-int4 \
     --sampling '{"chat_template_kwargs": {"enable_thinking": false}}'   # 실모델 평가
-    # --suite main (일반 9과제 × 조건) | lo (큰 관찰 7과제) | wf (워크플로 패턴 8과제)
-python -m pytest agent/tests -q                # 테스트 (조합 행렬 포함)
+    # --suite main (일반 9과제 × 조건) | lo (큰 관찰 7과제) | wf (워크플로 패턴 8과제) | heldout (한국어 HR 16과제)
+python -m agent.examples.llm_adapter_check     # LLM 어댑터 오프라인 점검 (any-llm 설치 시)
+python -m pytest agent/tests -q                # 테스트 (조합 행렬·어댑터 점검 포함)
 ```
 
 ## Tool & 서브에이전트
@@ -237,7 +245,10 @@ python -m pytest agent/tests -q                # 테스트 (조합 행렬 포함
 실행 단위는 `BaseTool`(`name`, `description`, `args_schema`, `run(**args)`)입니다.
 평범한 callable은 `registry.register(...)` / `@registry.tool(...)`로 등록하고, 더
 풍부한 tool은 `BaseTool` 서브클래스 인스턴스를 `registry.add(...)`로 추가합니다.
-tool의 `description`/`args_schema`는 planner에게 광고되어 라우팅을 돕습니다.
+tool의 `description`/`args_schema`는 모든 패턴의 프롬프트에 함께 표시됩니다.
+
+`register(...)` 옵션: `requires_approval=True`(실행 전 사람 승인), `writes=True`(부작용 있음 — 읽기 전용
+서브에이전트 안에서 거절), `output_schema={...}`(반환 형태 — planner가 `returns:`로 보고 `$N.field` 참조).
 
 **서브에이전트도 그냥 tool입니다**: `AgentTool`이 컴파일된 그래프를 감싸서 플랜이
 이름으로 라우팅할 수 있게 하고, 그 안에서 자기만의 루프를 돌린 뒤 결과를
@@ -304,12 +315,17 @@ task가 동시에 멈추면 `state["__interrupt__"]`에 여러 개가 오고,
 `examples/compose_matrix.py`가 패턴 쌍마다 검증합니다 (승인/거절/재시작/같은 자식
 2회 호출/병렬 2건).
 
-## 확장 (→ 뉴스→반응 에이전트)
+## 확장
 
-1. `ToolRegistry`에 실제 tool 등록 (예: `fetch_article`, `get_price_window`,
-   `extract_catalyst`, `predict_reaction`).
-2. `PLANNER_SYSTEM` / `JOINER_SYSTEM` 프롬프트를 도메인에 맞게 조정.
-3. `OpenAICompatLLM`을 vLLM 서버로 연결해 실행.
+**도메인에 적용**: 도구를 `ToolRegistry`에 등록하고(`args_schema` 권장, 부작용이 있으면 `writes=True`,
+위험하면 `requires_approval=True`), 등록부에서 패턴을 골라 빌드합니다. 도메인 지침은 react의 `system=`
+인자나 패턴별 프롬프트로 넣습니다. 실모델로 확인하려면 `examples/evals/`처럼 정답이 정해진 과제를 만들어 돌립니다.
 
-구조적 코어(`plan_execute/dag.py`, `plan_execute/graph.py`,
-`plan_execute/state.py`)는 그대로 유지됩니다.
+**새 패턴 추가**:
+1. 빌더 `build(*, llm, registry, **config) -> 컴파일된 그래프`를 작성합니다. `core/contract.py`의 입출력 계약을
+   지키고(`status` 포함), 도구·서브에이전트 호출은 반드시 `core.execution.execute_tool`로 합니다
+   (승인·읽기 전용·실패·trace가 여기서 처리됨).
+2. `patterns/builtin.py`에 표준 명칭과 함께 `register(PatternSpec(...))`.
+3. `examples/compose_matrix.py`에 시나리오를 추가합니다. 등록부에 있는데 행렬에 없으면
+   `registry_coverage`가 FAIL이 나서 빠뜨릴 수 없습니다.
+4. `docs/PATTERNS.md` 대응표를 갱신합니다.

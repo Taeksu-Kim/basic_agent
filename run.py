@@ -1,6 +1,6 @@
 """Entrypoint: wire an LLM + tool registry into an agent and run a query.
 
-Pick the agent type with ``--type plan|react``. Real runs use a vLLM server via
+Pick the pattern with ``--type <name|alias>`` (see ``--list-patterns``). Real runs use a vLLM server via
 :class:`OpenAICompatLLM` (OpenAI-compatible endpoint). ``--demo`` runs the chosen
 type fully offline with a ``FakeLLM`` and a couple of toy tools, so the wiring
 can be smoke-tested without a model server.
