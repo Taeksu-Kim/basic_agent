@@ -79,7 +79,7 @@ class AgentTool(BaseTool):
     get non-string results out of a sub-agent.
     """
 
-    _RESERVED = ("query", "history", "iteration")
+    _RESERVED = ("query", "history", "iteration", "status")  # contract-managed keys
 
     def __init__(
         self,
@@ -103,12 +103,27 @@ class AgentTool(BaseTool):
         self._result_key = result_key
 
     async def run(self, **kwargs: Any) -> Any:
+        # local imports: contract/execution import this module
+        from agent.core import trace
+        from agent.core.contract import initial_state, status_of
+        from agent.core.execution import failure
+
         query = kwargs[self._query_arg]
         extra = {k: v for k, v in kwargs.items()
                  if k != self._query_arg and k not in self._RESERVED}
-        state = await self._graph.ainvoke(
-            {**extra, "query": query, "history": [], "iteration": 0}
-        )
+        with trace.span(self.name):  # the sub-agent's events nest under this tool's name
+            state = await self._graph.ainvoke(initial_state(query, **extra))
+        # Contract-aware sub-agents report how they ended. Anything but "ok" comes
+        # back as a failure, so the parent can tell "the child failed / was cut
+        # off" from "the child answered ''". Graphs without a ``status`` key
+        # (pre-contract) are passed through unchanged.
+        if isinstance(state, dict) and "status" in state:
+            status = status_of(state)
+            if status != "ok":
+                why = state.get("error") or "stopped before finishing"
+                partial = state.get("final") or ""
+                return failure(f"sub-agent {self.name!r} ended with status={status}: {why}"
+                               + (f" (partial answer: {partial})" if partial else ""))
         return state.get(self._result_key)
 
 
@@ -165,6 +180,25 @@ class ToolRegistry:
     def describe(self) -> list[dict[str, Any]]:
         """Specs of all tools, sorted by name -- fed to the planner prompt."""
         return [self._tools[n].spec() for n in self.names()]
+
+    def format_for_prompt(self, only: Optional[list[str]] = None) -> str:
+        """The tool list every pattern shows the model: name, description and the
+        args schema. One formatter for all patterns -- react used to omit the args
+        schema, and a real model (Qwen3.8-27B) then guessed argument names
+        (``from_currency`` for ``from_ccy``, ``quantity`` for ``qty``) and failed."""
+        import json
+
+        lines = []
+        for spec in self.describe():
+            if only is not None and spec["name"] not in only:
+                continue
+            line = f"- {spec['name']}"
+            if spec.get("description"):
+                line += f": {spec['description']}"
+            if spec.get("args_schema"):
+                line += f"\n    args: {json.dumps(spec['args_schema'], ensure_ascii=False)}"
+            lines.append(line)
+        return "\n".join(lines)
 
     async def call(self, name: str, args: dict[str, Any]) -> Any:
         """Invoke a tool, awaiting it if it returns a coroutine."""

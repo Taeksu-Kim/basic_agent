@@ -18,33 +18,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
 
-from agent.core.hitl import approved, feedback_of
+from agent.core import trace
+from agent.core.context import DEFAULT_REACT_POLICY, ContextPolicy, run_harness_tool
+from agent.core.execution import execute_tool
+from agent.core.hitl import arun_graph, aresume_graph
 from agent.core.llm import LLMClient
 from agent.core.tools import ToolRegistry
 from agent.react import policy
 from agent.react.state import ReactState
 
 
-async def _run_tool(registry: ToolRegistry, action: dict[str, Any]) -> Any:
-    try:
-        return await registry.call(action["tool"], action.get("args", {}))
-    except GraphBubbleUp:
-        raise  # an interrupt inside a tool (e.g. ask_human) must pause, not error
-    except Exception as exc:  # noqa: BLE001 -- feed the error back as an observation
-        return {"error": f"{type(exc).__name__}: {exc}"}
-
-
-def _needs_approval(registry: ToolRegistry, name: str) -> bool:
-    return registry.has(name) and getattr(registry.get(name), "requires_approval", False)
-
-
 def build_react_agent(
     *, llm: LLMClient, registry: ToolRegistry, max_steps: int = 6,
-    checkpointer: Any = None, system: str | None = None
+    checkpointer: Any = None, system: str | None = None,
+    context_policy: ContextPolicy | None = DEFAULT_REACT_POLICY,
 ) -> Any:
     """Compile a ReAct agent for a given LLM + tool registry.
 
@@ -55,45 +44,45 @@ def build_react_agent(
     graph pauses (``interrupt``) before running them and resumes on a human
     verdict — approve runs the tool, reject feeds the denial back to the policy
     as the observation. Requires ``checkpointer``.
+
+    ``context_policy`` sets context-management features (see
+    :mod:`agent.core.context`). The default, ``DEFAULT_REACT_POLICY``, turns on
+    just-in-time reading of long observations (``read_observation``); ``None``
+    gives the original prompt (1,500-char truncation, no read tool).
     """
+    if context_policy is not None:
+        context_policy.check(registry)
+    policy_llm = trace.traced(llm, "react.policy")
+    compact_llm = trace.traced(llm, "react.compaction")
+    harness = context_policy.harness_tools(registry) if context_policy else {}
 
     def reason_node(state: ReactState) -> dict[str, Any]:
-        return policy.reason(state, llm, registry, system=system)
+        return policy.reason(state, policy_llm, registry, system=system,
+                             policy=context_policy, compact_llm=compact_llm)
 
     async def act_node(state: ReactState) -> dict[str, Any]:
         action = state["action"]
-        if _needs_approval(registry, action["tool"]):
-            verdict = interrupt(
-                {
-                    "type": "tool_approval",
-                    "tool": action["tool"],
-                    "args": action.get("args", {}),
-                    "thought": action.get("thought", ""),
-                }
+        extra: dict[str, Any] = {}
+        if action["tool"] in harness:
+            # harness tools read/write run state; no registry, no approval gate
+            observation, extra = run_harness_tool(action["tool"], action.get("args", {}),
+                                                  state, registry, context_policy)
+            trace.emit("tool_call", tool=action["tool"], args=trace.clip(action.get("args", {})),
+                       latency_ms=0.0, outcome="harness", detail=None)
+        else:
+            # approval gate, error capture, interrupt pass-through: all in execute_tool.
+            # A denial comes back as the observation so the policy can react to it.
+            observation = await execute_tool(
+                registry, action["tool"], action.get("args", {}),
+                approval="inline", thought=action.get("thought", ""),
             )
-            if not approved(verdict):
-                # denial becomes the observation so the policy can react to it
-                observation: Any = {
-                    "denied": f"tool call denied by user: {feedback_of(verdict)}"
-                }
-                return {
-                    "scratchpad": [
-                        {
-                            "thought": action.get("thought", ""),
-                            "tool": action["tool"],
-                            "args": action.get("args", {}),
-                            "observation": observation,
-                        }
-                    ]
-                }
-        observation = await _run_tool(registry, action)
         step = {
             "thought": action.get("thought", ""),
             "tool": action["tool"],
             "args": action.get("args", {}),
             "observation": observation,
         }
-        return {"scratchpad": [step]}
+        return {"scratchpad": [step], **extra}
 
     def route(state: ReactState) -> str:
         if state.get("action", {}).get("action") == "finish":
@@ -111,10 +100,6 @@ def build_react_agent(
     return builder.compile(checkpointer=checkpointer)
 
 
-def _config(thread_id: str | None) -> dict[str, Any] | None:
-    return {"configurable": {"thread_id": thread_id}} if thread_id else None
-
-
 async def arun(
     graph: Any, query: str, *, history: list[Any] | None = None, thread_id: str | None = None
 ) -> ReactState:
@@ -123,11 +108,9 @@ async def arun(
     With a checkpointer, pass ``thread_id`` so the run can pause (HITL) and be
     resumed later via :func:`aresume`.
     """
-    return await graph.ainvoke(
-        {"query": query, "history": history or [], "iteration": 0}, _config(thread_id)
-    )
+    return await arun_graph(graph, query, history=history, thread_id=thread_id)
 
 
 async def aresume(graph: Any, verdict: Any, *, thread_id: str) -> ReactState:
-    """Resume a paused (interrupted) run with the human's verdict."""
-    return await graph.ainvoke(Command(resume=verdict), _config(thread_id))
+    """Resume a paused run. See :func:`agent.core.hitl.aresume_graph` for verdict forms."""
+    return await aresume_graph(graph, verdict, thread_id=thread_id)

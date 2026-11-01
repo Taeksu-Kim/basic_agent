@@ -26,9 +26,11 @@ def merge_results(a: dict[int, Any] | None, b: dict[int, Any] | None) -> dict[in
 
 
 class AgentState(TypedDict, total=False):
-    # inputs
+    # inputs (keys follow agent.core.contract)
     query: str
     history: list[Any]
+    context: Any                      # caller-provided context; shown to the planner when present
+    status: str | None                # "ok" | "error"; unset at END -> capped (contract)
     # planning
     plan: list[dict[str, Any]]        # serialised Task dicts
     levels: list[list[int]]           # topological execution schedule
@@ -38,7 +40,9 @@ class AgentState(TypedDict, total=False):
     results: Annotated[dict[int, Any], merge_results]
     # HITL
     plan_rejected: bool               # human rejected the plan -> replan
+    preapproved: list[int]            # task ids the level gate already got approval for
     # joining
     decision: str                     # "finish" | "replan"
     decision_reason: str
     final: str
+    error: str                        # set when planner/joiner output stayed unusable -> run ends

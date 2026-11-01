@@ -86,8 +86,16 @@ def refs_in(value: Any) -> set[int]:
     return out
 
 
-def validate_plan(plan: Plan) -> None:
-    """Raise :class:`PlanError` if the plan is not a valid DAG."""
+def validate_plan(plan: Plan, registry: Any = None) -> None:
+    """Raise :class:`PlanError` if the plan is not a valid DAG.
+
+    With ``registry``, also reject tasks naming a tool that is not registered --
+    caught here, the planner can be asked again before anything runs.
+    """
+    if registry is not None:
+        unknown = sorted({t.tool for t in plan.tasks if not registry.has(t.tool)})
+        if unknown:
+            raise PlanError(f"unknown tools {unknown}; available tools: {registry.names()}")
     ids = [t.id for t in plan.tasks]
     if len(ids) != len(set(ids)):
         raise PlanError(f"duplicate task ids: {ids}")

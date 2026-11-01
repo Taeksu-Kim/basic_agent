@@ -15,6 +15,62 @@ LangGraph 기반 범용 에이전트 골격. TDD로 작성했습니다. **하나
 *뉴스 → 주가 반응 예측* 에이전트는 이 위에 실제 tool과 프롬프트를 끼워 넣어
 만듭니다.
 
+패턴은 **표준 명칭으로 등록부에 등록**되어 있습니다 (`python -m agent.run --list-patterns`).
+패턴별 업계 표준 명칭·출처·조합 규칙은 [`docs/PATTERNS.md`](docs/PATTERNS.md)에 있습니다.
+
+## 공통 계약 (`core/contract.py`) — 패턴이 서로 끼워지는 이유
+
+모든 패턴은 같은 입력으로 시작하고 같은 키로 끝납니다.
+
+| | 키 |
+|---|---|
+| 입력 | `query`, `history`, `context`(선택: 호출자가 넘기는 컨텍스트), `iteration` |
+| 출력 | `final`, `result`(선택: 구조화 결과), `status`, `error` |
+
+`status`는 실행이 어떻게 끝났는지입니다: `ok`(패턴이 스스로 끝냄) / `error`(재시도 후에도
+모델 출력을 쓸 수 없었음) / `capped`(스텝·재계획 상한에 걸림). `envelope(state)`가 어느
+패턴의 결과든 이 형태로 정규화합니다.
+
+`AgentTool`로 감싼 자식이 `ok`가 아닌 상태로 끝나면 부모는 실패 표식이 붙은 결과
+(`{"error": "sub-agent 'x' ended with status=capped: …", "__failure__": true}`)를 받습니다.
+`status` 키가 없는 기존(계약 이전) 그래프는 예전처럼 결과를 그대로 넘깁니다.
+
+```python
+from agent.patterns import registry as patterns
+graph = patterns.get("react").build(llm=llm, registry=tools, max_steps=8)
+graph = patterns.get("plan").build(llm=llm, registry=tools, checkpointer=saver)  # 별칭 가능
+```
+
+참고: react는 같은 `thread_id`로 다시 실행하면 이전 scratchpad가 누적됩니다
+(thread = 요청 1건 규약).
+
+## 컨텍스트 관리 (`core/context.py`, opt-in)
+
+빌더에 `context_policy=ContextPolicy(...)`로 지정합니다. **react의 기본값은
+`DEFAULT_REACT_POLICY = ContextPolicy(offload=True)`** 입니다 — 실모델 평가에서 잘라내기만 하면
+미리보기 밖의 답을 읽지 않고 "없다"고 단정하거나 지어냈기 때문입니다 (`docs/baseline.md`).
+`context_policy=None`이면 원래 프롬프트(1,500자 잘라내기, 읽기 도구 없음)입니다.
+plan_execute는 기본이 `None`(결과 전체 표시)이고, 프롬프트가 컨텍스트를 넘으면 결과를 잘라 한 번 재시도합니다. 효과는 모델에 따라 다르므로 기본값은 모두 꺼져 있습니다.
+
+| 옵션 | 기능 (표준 명칭) | 적용 |
+|---|---|---|
+| `offload=True` | 긴 관찰은 미리보기 + 포인터, `read_observation(step, offset)`로 이어 읽거나 `find="단어"`로 해당 위치로 점프 (just-in-time context). **react 기본** | react |
+| `keep_recent=N` | 최근 N개 관찰만 전문, 이전 것은 한 줄 표시 (tool-result clearing) | react |
+| `compact_at_chars=N` | 누적 스텝이 N자를 넘으면 오래된 스텝을 모델이 요약 (compaction) | react |
+| `notes=True` | `notes_write(text)`, 메모는 매 프롬프트에 표시 (structured note-taking) | react |
+| `skills=(Skill(...),)` | 스킬 이름·설명만 보여주고 `load_skill(name)`으로 본문 로드 (progressive disclosure). `load_skills(dir)`가 `<dir>/*/SKILL.md`를 읽음 | react |
+| `tool_search_threshold=N`, `core_tools=(...)` | 도구가 N개를 넘으면 핵심 도구만 노출, `tool_search(query)`로 찾은 도구를 추가 노출 | react |
+| `inline_chars=N` | 관찰·결과 한 건의 최대 노출 길이 (기본 1500) | react, plan_execute(planner·joiner의 결과 표시) |
+
+`read_observation`, `notes_write`, `load_skill`, `tool_search`는 루프가 직접 처리하는
+**하네스 도구**입니다(상태를 읽고 씀, 승인 게이트 없음). 같은 이름의 도구를 등록하면 빌드할 때 거부됩니다.
+
+```python
+from agent.core.context import ContextPolicy, load_skills
+policy = ContextPolicy(offload=True, keep_recent=4, notes=True, skills=tuple(load_skills("skills/")))
+graph = patterns.get("react").build(llm=llm, registry=tools, context_policy=policy)
+```
+
 ## `plan_execute` — 패턴
 
 두 표준 패턴을 합친 것입니다:
@@ -52,6 +108,10 @@ joiner가 판단). 리플랜 시 결과 네임스페이스는 새 플랜을 위�
 
 ## `react` — 패턴
 
+도구 목록은 planner와 같은 포맷터(`ToolRegistry.format_for_prompt`)로 만들며 **args 스키마를 포함**합니다.
+(2026-11-01 실모델 평가: 스키마가 없을 때 Qwen3.8-27B가 인자 이름을 추측해 9과제 중 3과제 실패 → 포함 후 0건.
+자세한 수치는 `docs/baseline.md`.) 인자 이름이 틀리면 도구 에러에 기대 스키마가 붙어 돌아갑니다.
+
 단일 reactive 루프: `reason`(LLM이 지금까지의 trajectory를 보고 다음 행동 결정:
 tool 호출 또는 finish) ↔ `act`(tool 실행, 관찰을 scratchpad에 append). `finish`
 또는 `max_steps` 상한에서 종료합니다. `plan_execute`와 달리 tool 에러는 abort하지
@@ -77,9 +137,16 @@ START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (
 | `react/state.py` | `ReactState` + scratchpad append reducer |
 | `react/policy.py` | 추론 스텝: trajectory → 다음 행동 (tool / finish) |
 | `react/graph.py` | reason↔act 루프; `build_react_agent`, `arun`, `aresume` |
-| `core/hitl.py` *(공유)* | HITL verdict 계약 (`approved`, `feedback_of`) |
+| `core/hitl.py` *(공유)* | HITL verdict 계약 (`approved`, `feedback_of`) + 공용 `arun_graph`/`aresume_graph` (다중 interrupt 재개) |
+| `core/execution.py` *(공유)* | **모든 패턴이 거치는 단일 도구 실행 경로** — 승인 게이트, 실패 표식, interrupt 통과, trace |
+| `core/trace.py` *(공유)* | 실행 기록 (JSONL, 중첩 서브에이전트는 `span`으로 구분). 기본 꺼짐 |
 | `core/checkpoint.py` *(공유)* | 로컬 SQLite checkpointer + thread 캡 pruner (최근 30개) |
-| `run.py` | CLI 엔트리포인트 (`--type plan\|react`, `--demo`는 오프라인) |
+| `core/contract.py` *(공유)* | 공통 입출력 계약, `status`, `envelope()` |
+| `core/context.py` *(공유)* | 컨텍스트 관리 옵션 (`ContextPolicy`, 하네스 도구, 스킬 로더) |
+| `patterns/registry.py` | 패턴 등록부 (`PatternSpec`: 표준 명칭·빌더·메타데이터), `patterns/builtin.py`에 기본 2종 등록 |
+| `run.py` | CLI 엔트리포인트 (`--type <패턴 또는 별칭>`, `--list-patterns`, `--demo`는 오프라인, `--trace DIR`) |
+| `examples/compose_matrix.py` | 조합 행렬: 등록된 모든 (부모, 자식) 패턴 쌍 × HITL·실패·계약 시나리오를 E2E 검증 |
+| `docs/` | `PATTERNS.md`(용어·표준 명칭), `WORKPLAN.md`(작업 계획), `baseline.md`(검증 기록) |
 
 ## LLM / 추론
 
@@ -99,7 +166,13 @@ python -m agent.run --demo --type plan         # 오프라인 스모크 테스�
 python -m agent.run --demo --type react
 python -m agent.run "your task" --type react \
     --base-url http://localhost:8000/v1 --model <served-model>   # 실제 vLLM
-python -m pytest agent/tests -q                # 82개 테스트
+python -m agent.run --demo-hitl --type plan    # 승인 필요 도구(publish)에서 멈추는 데모
+python -m agent.run --demo --type react --trace runs/   # 실행 기록(JSONL) 남기기
+python -m agent.examples.compose_matrix        # 조합 행렬 (FakeLLM, 표 출력)
+python -m agent.examples.evals.run_evals --base-url http://<IP>:8002/v1 \
+    --model qwen3.8-27b-redhat-int4 \
+    --sampling '{"chat_template_kwargs": {"enable_thinking": false}}'   # 실모델 평가 (9과제 × 3조건)
+python -m pytest agent/tests -q                # 테스트 (조합 행렬 포함)
 ```
 
 ## Tool & 서브에이전트
@@ -128,12 +201,18 @@ tool의 `description`/`args_schema`는 planner에게 광고되어 라우팅을 �
   태스크가 **전부 합류한 배리어**에서 멈추고 그 레벨의 결과를 보여줍니다.
   승인 → 다음 레벨, 거절+피드백 → 리플랜. 배리어는 단일 실행 지점이라
   동시 interrupt 문제가 없습니다.
-- **tool 승인 (react)** — `registry.register(..., requires_approval=True)`로
+- **tool 승인 (모든 패턴)** — `registry.register(..., requires_approval=True)`로
   플래그된 tool은 실행 직전에 멈춥니다. 거절하면 tool은 실행되지 않고 거절
-  사유가 observation으로 들어가 policy가 다음 행동을 정합니다.
-- **`ask_human` (react)** — `core/hitl.py`의 tool. 등록해두면 **모델이** 필요할
-  때 질문+선택지를 만들어 멈추고, 사람의 답이 tool의 반환값(observation)으로
-  들어가 추론이 이어집니다. 구조적 게이트의 보완재.
+  사유(`{"denied": ...}`)가 결과로 들어갑니다.
+  - react: 호출 1건마다 멈춤 (payload `tool_approval`).
+  - plan_execute: 레벨을 내보내기 **전에** 그 레벨의 승인 필요 task를 모아
+    **한 번만** 멈춤. 1건이면 `tool_approval`, 여러 건이면 `tool_approvals`
+    (`items` 목록). 여러 건의 verdict는 전체 일괄(`True` 등) 또는 task별
+    `{"decisions": {task_id: verdict}}`. 승인된 task는 실행되고, 거절된 task는
+    거절 결과가 남으며, **다음 레벨은 실행되지 않고** joiner가 판단합니다.
+- **`ask_human` (모든 패턴)** — `core/hitl.py`의 tool. 등록해두면 **모델이** 필요할
+  때 질문+선택지를 만들어 멈추고, 사람의 답이 tool의 반환값으로 들어가 추론이
+  이어집니다. 구조적 게이트의 보완재.
 
 ```python
 from agent.core.checkpoint import open_async_saver, open_saver, prune_threads
@@ -160,10 +239,13 @@ python -m agent.run --demo --type plan --approve-plans --state s.db  # SQLite �
 불가능하기 때문입니다. saver는 2종: `open_async_saver`(그래프 실행용 —
 동기 `SqliteSaver`는 `ainvoke`를 거부), `open_saver`(pruning/조회용, 같은 스키마).
 
-현재 제약: HITL은 **최상위 그래프 전용**입니다. `AgentTool`로 감싼 서브에이전트
-내부의 interrupt는 부모로 전파/재개되지 않으므로, 서브에이전트에는 승인 게이트를
-켜지 마세요. `ask_human`도 plan_execute의 병렬 레벨 안에서는 쓰지 마세요
-(동시 다발 interrupt의 resume 매핑 미지원 — react 전용).
+**중첩과 동시 interrupt**: `AgentTool`로 감싼 서브에이전트 안의 승인 게이트·
+`ask_human`도 부모 그래프를 멈추고, 부모를 재개하면 자식이 멈춘 지점부터
+이어집니다 (부모에만 checkpointer를 주면 됨). plan_execute의 병렬 레벨에서 여러
+task가 동시에 멈추면 `state["__interrupt__"]`에 여러 개가 오고,
+`aresume(graph, {interrupt.id: verdict, ...})`로 한 번에 재개합니다. 이 동작은
+`examples/compose_matrix.py`가 패턴 쌍마다 검증합니다 (승인/거절/재시작/같은 자식
+2회 호출/병렬 2건).
 
 ## 확장 (→ 뉴스→반응 에이전트)
 

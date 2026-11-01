@@ -18,6 +18,21 @@ import json
 from typing import Any, Optional, Protocol, runtime_checkable
 
 
+# Exceptions that mean "the model's output was unusable" (not JSON, wrong shape,
+# failed validation) -- worth a retry with the error fed back. Every pattern's
+# parser catches exactly this set (PlanError, ActionError and JSONDecodeError are
+# all ValueErrors).
+OUTPUT_ERRORS: tuple[type[Exception], ...] = (ValueError, TypeError, KeyError, AttributeError)
+
+
+class ContextOverflowError(RuntimeError):
+    """The prompt (+ requested output) exceeds the model's context window.
+
+    Raised instead of a generic HTTP error so callers can shrink the prompt and
+    retry, or end the run gracefully -- an unhandled overflow used to crash the run
+    (plan_execute joiner with a 60k-char tool result, 2026-11-01)."""
+
+
 @runtime_checkable
 class LLMClient(Protocol):
     def complete(self, system: str, user: str, *, schema: Optional[dict] = None) -> str: ...
@@ -69,6 +84,14 @@ class OpenAICompatLLM:
         # max_tokens 기본 상한: 미설정 시 소형 모델의 반복 폭주가 컨텍스트를
         # 다 먹고 JSON이 중간에 잘리는 사고가 난다 (실측). sampling으로 덮어쓰기.
         self.sampling = {"temperature": 0, "max_tokens": 1024, **(sampling or {})}
+        import threading
+
+        self._local = threading.local()  # per-thread: parallel nodes call from several threads
+
+    @property
+    def last_usage(self) -> Optional[dict]:
+        """Token usage of this thread's most recent call (read by the tracer)."""
+        return getattr(self._local, "usage", None)
 
     def complete(self, system: str, user: str, *, schema: Optional[dict] = None) -> str:
         import requests  # lazy
@@ -93,10 +116,14 @@ class OpenAICompatLLM:
             json=payload,
             timeout=self.timeout,
         )
+        if resp.status_code == 400 and "maximum context length" in resp.text:
+            raise ContextOverflowError(f"LLM context overflow: {resp.text[:300]}")
         if resp.status_code >= 400:
             # surface the server's reason -- a bare 400 is undebuggable
             raise RuntimeError(f"LLM HTTP {resp.status_code}: {resp.text[:500]}")
-        return resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        self._local.usage = data.get("usage")
+        return data["choices"][0]["message"]["content"]
 
 
 class AnthropicLLM:
@@ -114,7 +141,7 @@ class AnthropicLLM:
         import anthropic  # lazy
 
         if schema is not None:
-            system = f"{system}\n\nRespond with JSON matching this schema:\n{json.dumps(schema)}"
+            system = f"{system}\n\nRespond with JSON matching this schema:\n{json.dumps(schema, ensure_ascii=False)}"
         client = anthropic.Anthropic()
         msg = client.messages.create(
             model=self.model,
