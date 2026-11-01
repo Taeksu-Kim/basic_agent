@@ -30,6 +30,7 @@
 | 4 | 일부 완료 | 4A.1·4A.3 (실모델 근거로 기본값), **4B.3 읽기 전용 자식, 4B.4 구조화 결과(`output_schema`, `$N.field`)**. 미착수: 4A.2(한 스텝 여러 행동), 4B.1(컨텍스트 자동 전달), 4C(네이티브 tool calling) |
 | 6 | **완료** | prompt_chain · router · parallel · evaluator_optimizer · orchestrator_workers. 행렬 111/111, 실모델 wf 8/8 (`docs/baseline.md`) |
 | 7 | **완료** | README·PATTERNS 갱신, `CHANGELOG.md`, `docs/MIGRATION.md` |
+| 홀드아웃 | **완료** | 한국어 HR 16과제, 실행 전 커밋 `278beba`로 고정 → **16/16** (튜닝 없음). 한계: 1회·모델 1개·작성자 편향 |
 
 **2026-11-01 결정: react에서 `offload`(just-in-time 읽기)를 기본으로 켬** (사용자가 "더 고민해보고 맞는 쪽으로" 요청 → 추가 검증 후 결정)
 - 근거: 큰 관찰 변형 7과제에서 기본(잘라내기)은 미리보기 밖 답을 **한 번도 읽지 않고** 4과제 모두 "없다"고 단정하거나 지어냄. offload는 인터페이스 수정 후 7/7. 일반 9과제에서 손해 0. 필요 없는 과제의 추가 비용은 호출당 약 60토큰

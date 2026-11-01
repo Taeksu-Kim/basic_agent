@@ -158,6 +158,33 @@
 
 planner 프롬프트 변경 후 plan_execute 일반 9과제 재확인: **9/9**. 대조: `output_schema` 없는 `nested_researcher`는 여전히 문장형 답을 숫자 인자에 넣어 1회 실패 후 복구.
 
+## 홀드아웃 평가 (`--suite heldout`) — 2026-11-01
+
+**과제와 판정 기준은 실행 전 커밋 `278beba`에서 고정**했고, 결과를 본 뒤 코드·프롬프트를 바꾸지 않았다.
+도메인을 일부러 바꿨다: 한국어 사내 HR (지금까지는 영어 금융), 질문 표현이 문서에 없는 과제, 표, 날짜 계산, 등록된 7개 패턴 전부.
+
+| 과제 | 패턴 | 결과 | 관찰 |
+|---|---|---|---|
+| h_leave_left (react / plan) | react, plan_execute | OK / OK | plan: `find_employee`가 **목록**을 반환하는데 planner가 `$1` 전체를 사번 자리에 넣어 1회 실패 → 재계획 복구 |
+| h_paraphrase (react / plan) | react, plan_execute | OK / OK | 질문 "아이를 돌보기 위해" (문서에 없는 표현) → react가 스스로 `find="육아"`를 골라 2,097자 지점의 육아휴직 조항을 찾음 |
+| h_table (react / plan) | react, plan_execute | OK / OK | react: 미리보기 밖 표를 `read_observation` 1회로 읽음 |
+| h_tenure_table (react / plan) | react, plan_execute | OK / OK | 입사일 → 근속 계산 → 연차 표 |
+| h_ids_plan | plan_execute | OK | |
+| h_ticket_react | react (승인 필요 쓰기 도구) | OK | |
+| h_router_it | router → it_agent → 티켓 | OK | |
+| h_parallel | parallel (섹션 2 + LLM 종합) | OK | |
+| h_orchestrator | orchestrator_workers | OK | |
+| h_nested_structured | plan_execute + `output_schema` (`days_left`) | OK | 도구 실패 0. planner 예시(`$1.total`)와 다른 필드명에서도 `$1.days_left`를 바로 씀 |
+| h_evaluator | evaluator_optimizer (한국어 형식 기준 5개) | OK | 1라운드 통과 |
+| h_chain | prompt_chain (조회 → 날짜 추출 gate → 계산) | OK | |
+| **합계** | | **16/16** | |
+
+추가 확인: planner 예시를 평가 필드명(`$1.price_usd`)에서 중립(`$1.total`)으로 바꾼 뒤 기존 `nested_structured`도 OK (도구 실패 0) — 이전 통과가 예시에 기댄 것은 아님.
+
+**근거 강도와 한계**: 과제마다 1회, 모델 1개(Qwen3.8-27B). 과제는 프레임워크를 만든 쪽(이 세션)이 썼으므로 작성자 편향이 남는다. 가짜 도구·짧은 문서(4,032자). "도메인을 바꿔도 깨지지 않는다"는 근거로는 쓸 수 있지만, 다른 모델·실제 데이터·긴 과제에서의 성능은 확인하지 않았다.
+
+**기록만 하고 고치지 않은 것** (홀드아웃 규칙): plan_execute는 실행 전에 도구 결과의 형태를 모르므로, 목록·객체를 반환하는 도구에서 `$N` 전체를 넘기는 실수가 난다. 도구에 `output_schema`를 선언하면 planner가 `returns:`를 보고 `$N[0].field`를 쓸 수 있다 (기능은 있음, 기본 도구 등록에서 권장할지는 다음 검증 대상).
+
 ## 남은 관찰
 - 같은 `thread_id`로 react를 다시 실행하면 이전 scratchpad가 누적됨 [측정: 1회차 1스텝 → 2회차 2스텝]. plan_execute는 새 계획마다 결과를 비우므로 누적 없음 [측정]. **결정: 막지 않고 문서화** (thread = 요청 1건 규약. 누적을 대화 기억으로 쓰는 경우도 있음). `react/state.py`, README에 기재
 - **실모델 기준선(0.3)**: 아직 없음. vLLM 필요
