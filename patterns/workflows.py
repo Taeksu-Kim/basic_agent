@@ -225,7 +225,7 @@ def build_router(*, llm: LLMClient, registry: ToolRegistry, routes: Optional[dic
     desc = routes or {n: registry.get(n).description for n in names}
     route_llm = trace.traced(llm, "router.classify")
     schema = {"type": "object",
-              "properties": {"route": {"enum": names}, "args": {"type": "object"},
+              "properties": {"route": {"type": "string", "enum": names}, "args": {"type": "object"},
                              "reason": {"type": "string"}},
               "required": ["route"]}
 
@@ -488,15 +488,15 @@ def build_orchestrator_workers(*, llm: LLMClient, registry: ToolRegistry,
     plan_schema = {"type": "object", "properties": {"subtasks": {
         "type": "array", "minItems": 1, "maxItems": max_workers,
         "items": {"type": "object",
-                  "properties": {"worker": {"enum": names}, "objective": {"type": "string"},
+                  "properties": {"worker": {"type": "string", "enum": names}, "objective": {"type": "string"},
                                  "output_format": {"type": "string"},
                                  "boundaries": {"type": "string"}},
                   "required": ["worker", "objective"]}}},
         "required": ["subtasks"]}
-    finish = {"type": "object", "properties": {"decision": {"const": "finish"},
+    finish = {"type": "object", "properties": {"decision": {"type": "string", "const": "finish"},
                                                "final": {"type": "string"}},
               "required": ["decision", "final"]}
-    more = {"type": "object", "properties": {"decision": {"const": "more"},
+    more = {"type": "object", "properties": {"decision": {"type": "string", "const": "more"},
                                              "reason": {"type": "string"}},
             "required": ["decision", "reason"]}
 

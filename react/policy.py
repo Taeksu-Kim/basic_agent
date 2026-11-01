@@ -33,7 +33,7 @@ ACTION_SCHEMA: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "thought": {"type": "string"},
-                "action": {"const": "tool"},
+                "action": {"type": "string", "const": "tool"},
                 "tool": {"type": "string"},
                 "args": {"type": "object"},
             },
@@ -43,7 +43,7 @@ ACTION_SCHEMA: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "thought": {"type": "string"},
-                "action": {"const": "finish"},
+                "action": {"type": "string", "const": "finish"},
                 "final": {"type": "string"},
                 "result": {"type": "object"},  # optional structured payload on finish
             },

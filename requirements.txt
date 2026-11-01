@@ -6,6 +6,8 @@ aiosqlite                    # async saver -- the graphs run via ainvoke
 # optional providers (lazily imported; install what you use)
 #   OpenAICompatLLM (vLLM) needs: requests
 #   AnthropicLLM         needs: anthropic
+#   AnyLLMClient         needs: any-llm-sdk with the provider extras you use, pinned, e.g.
+#                        any-llm-sdk[openai,anthropic]==1.37.0   (checked offline: examples/llm_adapter_check.py)
 requests
 
 # dev / tests
