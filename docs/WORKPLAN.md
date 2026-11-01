@@ -15,6 +15,10 @@
 | 2026-11-01 | (구현 중 결정) 레벨 안에서 일부 task가 거절되어도 **같은 레벨의 승인된 task는 실행**하고, **다음 레벨부터** early-abort 한다. 같은 레벨 task는 서로 독립이고, 사람이 task별로 판정했기 때문 |
 | 2026-11-01 | 위 두 구현 중 결정을 사용자가 확인함. Phase 2~3을 FakeLLM으로 이어서 진행 (커밋은 사용자 요청 시) |
 
+## ⏰ 리마인드 대기 (사용자 요청, 2026-11-01)
+- **컴팩션 · 메모(notes) · 스킬의 실모델 검증** — 없애지 않는다. 4B.3·4B.4·Phase 6을 마친 뒤 사용자에게 다시 알린다.
+  검증할 것: 27B가 compaction 요약에서 나중에 필요한 사실을 보존하는가 / `notes_write`를 스스로 쓰는가 / 스킬 목록을 보고 `load_skill`을 부르는가.
+
 ## 진행 현황
 | Phase | 상태 | 비고 |
 |---|---|---|
@@ -23,8 +27,9 @@
 | 2 | **완료** | `docs/PATTERNS.md`. 학술 출처 6건은 arXiv에서 제목·날짜·초록 확인, LangChain 최신 분류(Subagents/Handoffs/Skills/Router) 반영 |
 | 3 | **완료** | `core/contract.py`, `patterns/registry.py`, `run.py --list-patterns`. 행렬 62/62, 테스트 98 통과. 진행 중 형제 결함 D6 발견·수정 |
 | 5 | **구조 완료** (opt-in) | `core/context.py` + react 통합, plan_execute는 결과 표시 제한만. 행렬 73/73. 정책 없을 때 프롬프트가 원본과 바이트 동일함을 확인. **효과(행동) 검증은 9B 필요** |
-| 4 | 일부 완료 | **4A.1 (react args 스키마), 4A.3 (인자 오류에 기대 스키마)** — 실모델 근거로 기본값에 반영. 나머지 미착수 |
-| 6, 7 | 미착수 | |
+| 4 | 일부 완료 | 4A.1·4A.3 (실모델 근거로 기본값), **4B.3 읽기 전용 자식, 4B.4 구조화 결과(`output_schema`, `$N.field`)**. 미착수: 4A.2(한 스텝 여러 행동), 4B.1(컨텍스트 자동 전달), 4C(네이티브 tool calling) |
+| 6 | **완료** | prompt_chain · router · parallel · evaluator_optimizer · orchestrator_workers. 행렬 111/111, 실모델 wf 8/8 (`docs/baseline.md`) |
+| 7 | **완료** | README·PATTERNS 갱신, `CHANGELOG.md`, `docs/MIGRATION.md` |
 
 **2026-11-01 결정: react에서 `offload`(just-in-time 읽기)를 기본으로 켬** (사용자가 "더 고민해보고 맞는 쪽으로" 요청 → 추가 검증 후 결정)
 - 근거: 큰 관찰 변형 7과제에서 기본(잘라내기)은 미리보기 밖 답을 **한 번도 읽지 않고** 4과제 모두 "없다"고 단정하거나 지어냄. offload는 인터페이스 수정 후 7/7. 일반 9과제에서 손해 0. 필요 없는 과제의 추가 비용은 호출당 약 60토큰

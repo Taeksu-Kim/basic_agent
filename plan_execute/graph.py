@@ -155,8 +155,15 @@ def build_graph(
                  and needs_approval(registry, by_id[tid]["tool"])]
         if not gated:
             return {}
-        items = [{"task_id": tid, "tool": by_id[tid]["tool"],
-                  "args": substitute_args(by_id[tid].get("args", {}), results)} for tid in gated]
+        items = []
+        for tid in gated:
+            try:
+                args = substitute_args(by_id[tid].get("args", {}), results)
+            except PlanError:
+                continue  # unresolvable reference: dispatch fails this task; nothing to approve
+            items.append({"task_id": tid, "tool": by_id[tid]["tool"], "args": args})
+        if not items:
+            return {}
         if len(items) == 1:  # same payload shape as react's per-call gate
             it = items[0]
             payload = approval_payload(it["tool"], it["args"], thought="", task_id=it["task_id"])
@@ -195,7 +202,12 @@ def build_graph(
             if tid in results:  # already settled (denied at the gate)
                 continue
             task = by_id[tid]
-            args = substitute_args(task.get("args", {}), results)
+            try:
+                args = substitute_args(task.get("args", {}), results)
+            except PlanError as exc:  # e.g. $1.price_usd but task 1 returned text -> task fails
+                sends.append(Send("run_task", {"id": tid, "tool": task["tool"],
+                                               "arg_error": str(exc)}))
+                continue
             sends.append(Send("run_task", {"id": tid, "tool": task["tool"], "args": args,
                                            "preapproved": tid in preapproved}))
         return sends or "join"  # whole level denied -> let the joiner decide

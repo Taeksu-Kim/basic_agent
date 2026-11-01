@@ -18,6 +18,39 @@ LangGraph 기반 범용 에이전트 골격. TDD로 작성했습니다. **하나
 패턴은 **표준 명칭으로 등록부에 등록**되어 있습니다 (`python -m agent.run --list-patterns`).
 패턴별 업계 표준 명칭·출처·조합 규칙은 [`docs/PATTERNS.md`](docs/PATTERNS.md)에 있습니다.
 
+## 패턴 목록 (등록부)
+
+| 등록 이름 (별칭) | 표준 명칭 | 하는 일 |
+|---|---|---|
+| `react` | ReAct | 한 스텝씩: 추론 → 도구 1개 → 관찰 → … → 종료 |
+| `plan_execute` (`plan`) | Plan-and-Execute + LLMCompiler | 도구 호출 DAG 계획 → 레벨 병렬 실행 → joiner 종료/재계획 |
+| `prompt_chain` (`chain`) | Prompt chaining | 고정 단계(LLM 프롬프트 또는 도구) 순서 실행, 단계 사이 gate |
+| `router` | Routing | 요청 분류(스키마로 경로 제한) → 경로 하나에 위임 |
+| `parallel` (`parallelization`) | Parallelization | sectioning(섹션 병렬 → 이어붙임/LLM 종합) 또는 voting(n회 → 다수결) |
+| `evaluator_optimizer` (`evaluator`) | Evaluator-optimizer | 생성 → 깨끗한 컨텍스트의 평가자가 기준 채점 → 수정, 상한까지 |
+| `orchestrator_workers` (`orchestrator`) | Orchestrator-workers | 실행 중 하위 과제 결정 → 워커(기본 읽기 전용) 병렬 → 종합 또는 추가 라운드 |
+
+**워크플로 패턴(아래 5개)의 위임 대상은 등록부의 도구**입니다. 서브에이전트는 `AgentTool`로 넣습니다.
+그래서 승인 게이트·중첩 HITL·병렬 interrupt·읽기 전용·실패 전달·trace가 모든 패턴에 똑같이 적용됩니다.
+
+```python
+from agent.core.tools import AgentTool, ToolRegistry
+from agent.patterns import registry as patterns
+
+tools = ToolRegistry()
+tools.add(AgentTool("researcher", patterns.get("react").build(llm=llm, registry=search_tools),
+                    description="looks things up", read_only=True,
+                    output_schema={"type": "object", "properties": {"price_usd": {"type": "number"}},
+                                   "required": ["price_usd"]}))
+router = patterns.get("router").build(llm=llm, registry=tools, routes={"researcher": "price questions"})
+```
+
+`AgentTool` 옵션:
+- `read_only=True`: 자식(과 그 자식) 안에서 `writes=True` 도구를 거절 (single writer)
+- `output_schema={...}`: 자식에게 그 형태의 `result`를 요청하고 그 객체를 반환. planner는 `returns:`를 보고
+  `$1.price_usd`로 필드를 참조. 형태가 맞지 않으면 실패로 반환 (문장이 숫자 자리에 들어가지 않음)
+- 호출 인자 `context=...`: 자식 프롬프트에 "Context from the caller"로 전달
+
 ## 공통 계약 (`core/contract.py`) — 패턴이 서로 끼워지는 이유
 
 모든 패턴은 같은 입력으로 시작하고 같은 키로 끝납니다.
@@ -143,7 +176,8 @@ START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (
 | `core/checkpoint.py` *(공유)* | 로컬 SQLite checkpointer + thread 캡 pruner (최근 30개) |
 | `core/contract.py` *(공유)* | 공통 입출력 계약, `status`, `envelope()` |
 | `core/context.py` *(공유)* | 컨텍스트 관리 옵션 (`ContextPolicy`, 하네스 도구, 스킬 로더) |
-| `patterns/registry.py` | 패턴 등록부 (`PatternSpec`: 표준 명칭·빌더·메타데이터), `patterns/builtin.py`에 기본 2종 등록 |
+| `patterns/registry.py` | 패턴 등록부 (`PatternSpec`: 표준 명칭·빌더·메타데이터), `patterns/builtin.py`에서 7종 등록 |
+| `patterns/workflows.py` | 워크플로 패턴 5종 (prompt_chain, router, parallel, evaluator_optimizer, orchestrator_workers) |
 | `run.py` | CLI 엔트리포인트 (`--type <패턴 또는 별칭>`, `--list-patterns`, `--demo`는 오프라인, `--trace DIR`) |
 | `examples/compose_matrix.py` | 조합 행렬: 등록된 모든 (부모, 자식) 패턴 쌍 × HITL·실패·계약 시나리오를 E2E 검증 |
 | `docs/` | `PATTERNS.md`(용어·표준 명칭), `WORKPLAN.md`(작업 계획), `baseline.md`(검증 기록) |
@@ -167,11 +201,13 @@ python -m agent.run --demo --type react
 python -m agent.run "your task" --type react \
     --base-url http://localhost:8000/v1 --model <served-model>   # 실제 vLLM
 python -m agent.run --demo-hitl --type plan    # 승인 필요 도구(publish)에서 멈추는 데모
+python -m agent.run "hello agent" --demo --type router   # 워크플로 패턴 오프라인 데모 (chain/router/parallel/evaluator/orchestrator)
 python -m agent.run --demo --type react --trace runs/   # 실행 기록(JSONL) 남기기
 python -m agent.examples.compose_matrix        # 조합 행렬 (FakeLLM, 표 출력)
 python -m agent.examples.evals.run_evals --base-url http://<IP>:8002/v1 \
     --model qwen3.8-27b-redhat-int4 \
-    --sampling '{"chat_template_kwargs": {"enable_thinking": false}}'   # 실모델 평가 (9과제 × 3조건)
+    --sampling '{"chat_template_kwargs": {"enable_thinking": false}}'   # 실모델 평가
+    # --suite main (일반 9과제 × 조건) | lo (큰 관찰 7과제) | wf (워크플로 패턴 8과제)
 python -m pytest agent/tests -q                # 테스트 (조합 행렬 포함)
 ```
 

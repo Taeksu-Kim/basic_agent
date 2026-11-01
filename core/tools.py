@@ -32,6 +32,8 @@ class BaseTool(ABC):
     description: str = ""
     args_schema: Optional[dict] = None
     requires_approval: bool = False  # HITL: pause for human approval before running
+    writes: bool = False             # has side effects; refused inside read-only sub-agents
+    output_schema: Optional[dict] = None  # shape of the result, advertised to planners
 
     @abstractmethod
     def run(self, **kwargs: Any) -> Any:
@@ -40,7 +42,10 @@ class BaseTool(ABC):
 
     def spec(self) -> dict[str, Any]:
         """Machine-readable description advertised to the planner."""
-        return {"name": self.name, "description": self.description, "args_schema": self.args_schema}
+        spec = {"name": self.name, "description": self.description, "args_schema": self.args_schema}
+        if self.output_schema:
+            spec["output_schema"] = self.output_schema
+        return spec
 
 
 class FunctionTool(BaseTool):
@@ -53,11 +58,15 @@ class FunctionTool(BaseTool):
         description: str = "",
         args_schema: Optional[dict] = None,
         requires_approval: bool = False,
+        writes: bool = False,
+        output_schema: Optional[dict] = None,
     ) -> None:
         self.name = name
         self.description = description
         self.args_schema = args_schema
         self.requires_approval = requires_approval
+        self.writes = writes
+        self.output_schema = output_schema
         self._func = func
 
     def run(self, **kwargs: Any) -> Any:
@@ -90,7 +99,18 @@ class AgentTool(BaseTool):
         args_schema: Optional[dict] = None,
         query_arg: str = "query",
         result_key: str = "final",
+        read_only: bool = False,
+        output_schema: Optional[dict] = None,
     ) -> None:
+        """``read_only``: tools marked ``writes=True`` are refused anywhere inside this
+        sub-agent (and its own sub-agents) -- single-writer: only the caller acts.
+
+        ``output_schema``: ask the sub-agent to finish with a structured ``result`` of
+        this shape and return that object (planners see it as ``returns`` and can
+        reference fields: ``$1.price_usd``). If the sub-agent doesn't produce a
+        matching ``result``, the call comes back as a failure -- never as free text
+        silently standing in for a number.
+        """
         self.name = name
         self.description = description
         self.args_schema = args_schema or {
@@ -101,17 +121,32 @@ class AgentTool(BaseTool):
         self._graph = graph
         self._query_arg = query_arg
         self._result_key = result_key
+        self.read_only = read_only
+        self.output_schema = output_schema
+
+    def _context_with_schema(self, context: Any) -> Any:
+        import json
+
+        ask = ("Finish with `result`: a JSON object matching this schema "
+               f"{json.dumps(self.output_schema, ensure_ascii=False)}, and a one-line `final`.")
+        if context is None:
+            return ask
+        base = context if isinstance(context, str) else json.dumps(context, ensure_ascii=False,
+                                                                   default=str)
+        return f"{base}\n\n{ask}"
 
     async def run(self, **kwargs: Any) -> Any:
         # local imports: contract/execution import this module
         from agent.core import trace
         from agent.core.contract import initial_state, status_of
-        from agent.core.execution import failure
+        from agent.core.execution import failure, read_only_scope
 
         query = kwargs[self._query_arg]
         extra = {k: v for k, v in kwargs.items()
                  if k != self._query_arg and k not in self._RESERVED}
-        with trace.span(self.name):  # the sub-agent's events nest under this tool's name
+        if self.output_schema is not None:
+            extra["context"] = self._context_with_schema(extra.get("context"))
+        with trace.span(self.name), read_only_scope(self.name if self.read_only else None):
             state = await self._graph.ainvoke(initial_state(query, **extra))
         # Contract-aware sub-agents report how they ended. Anything but "ok" comes
         # back as a failure, so the parent can tell "the child failed / was cut
@@ -124,7 +159,39 @@ class AgentTool(BaseTool):
                 partial = state.get("final") or ""
                 return failure(f"sub-agent {self.name!r} ended with status={status}: {why}"
                                + (f" (partial answer: {partial})" if partial else ""))
+        if self.output_schema is not None:
+            result = state.get("result") if isinstance(state, dict) else None
+            problem = schema_mismatch(self.output_schema, result)
+            if problem:
+                return failure(f"sub-agent {self.name!r} returned no `result` matching its "
+                               f"output_schema ({problem}); its answer was: "
+                               f"{(state or {}).get('final', '')!r}")
+            return result
         return state.get(self._result_key)
+
+
+_JSON_TYPES = {"string": str, "number": (int, float), "integer": int, "boolean": bool,
+               "object": dict, "array": list}
+
+
+def schema_mismatch(schema: dict, value: Any) -> str:
+    """Shallow check of ``value`` against a JSON schema ('' if it fits): top-level
+    type, required keys, and the declared type of each present property."""
+    want = schema.get("type")
+    if want and want in _JSON_TYPES and not isinstance(value, _JSON_TYPES[want]):
+        return f"expected {want}, got {type(value).__name__}"
+    if isinstance(value, dict):
+        missing = [k for k in schema.get("required", []) if k not in value]
+        if missing:
+            return f"missing {missing}"
+        for key, sub in (schema.get("properties") or {}).items():
+            t = sub.get("type") if isinstance(sub, dict) else None
+            if key in value and t in _JSON_TYPES:
+                ok = isinstance(value[key], _JSON_TYPES[t]) and not (
+                    t in ("number", "integer") and isinstance(value[key], bool))
+                if not ok:
+                    return f"{key}: expected {t}, got {type(value[key]).__name__}"
+    return ""
 
 
 class ToolRegistry:
@@ -148,9 +215,12 @@ class ToolRegistry:
         description: str = "",
         args_schema: Optional[dict] = None,
         requires_approval: bool = False,
+        writes: bool = False,
+        output_schema: Optional[dict] = None,
     ) -> FunctionTool:
         """Wrap and register a plain callable."""
-        tool = FunctionTool(name, func, description, args_schema, requires_approval)
+        tool = FunctionTool(name, func, description, args_schema, requires_approval,
+                            writes, output_schema)
         self.add(tool)
         return tool
 
@@ -197,6 +267,8 @@ class ToolRegistry:
                 line += f": {spec['description']}"
             if spec.get("args_schema"):
                 line += f"\n    args: {json.dumps(spec['args_schema'], ensure_ascii=False)}"
+            if spec.get("output_schema"):
+                line += f"\n    returns: {json.dumps(spec['output_schema'], ensure_ascii=False)}"
             lines.append(line)
         return "\n".join(lines)
 

@@ -19,8 +19,10 @@ Result shapes (what the model / joiner sees):
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import time
-from typing import Any, Literal, Optional
+from typing import Any, Iterator, Literal, Optional
 
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
@@ -30,6 +32,24 @@ from agent.core.hitl import approved, feedback_of
 from agent.core.tools import ToolRegistry
 
 FAILURE_KEY = "__failure__"
+
+# Names of the read-only sub-agents we are currently inside (innermost last).
+_READ_ONLY: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "agent_read_only", default=())
+
+
+@contextlib.contextmanager
+def read_only_scope(agent_name: Optional[str]) -> Iterator[None]:
+    """Inside, tools marked ``writes=True`` are refused (``None`` = no change).
+    Nested scopes stack, so a read-only sub-agent's own sub-agents stay read-only."""
+    if agent_name is None:
+        yield
+        return
+    token = _READ_ONLY.set(_READ_ONLY.get() + (agent_name,))
+    try:
+        yield
+    finally:
+        _READ_ONLY.reset(token)
 
 Approval = Literal["inline", "preapproved"]
 
@@ -98,6 +118,13 @@ async def execute_tool(
     whole graph instead of being recorded as an error.
     """
     args = args or {}
+    scope = _READ_ONLY.get()
+    if scope and registry.has(name) and getattr(registry.get(name), "writes", False):
+        refused = failure(f"tool {name!r} has side effects and is not allowed inside "
+                          f"read-only sub-agent {scope[-1]!r}; report what should be done instead")
+        trace.emit("tool_call", tool=name, args=trace.clip(args), latency_ms=0.0,
+                   outcome="failure", detail=refused["error"])
+        return refused
     if approval == "inline" and needs_approval(registry, name):
         verdict = interrupt(approval_payload(name, args, thought=thought))
         denied = record_verdict(name, verdict)

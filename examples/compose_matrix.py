@@ -167,6 +167,8 @@ def _child_registry(log: list) -> ToolRegistry:
         return answer
 
     reg.register("ask", ask, description="ask the human")
+    reg.register("write_db", lambda: log.append("write_db") or "written",
+                 description="writes to the database", writes=True)
     return reg
 
 
@@ -378,9 +380,27 @@ async def pair_parallel_interrupts(rep: Report, pk: str, ck: str) -> None:
                 _short(f"CRASH {type(e).__name__}: {e}"), fix="1.3")
 
 
+
+async def pair_read_only(rep: Report, pk: str, ck: str) -> None:
+    """read_only 자식이 쓰기 도구를 부르면 거절되고(실행 0회) 부모는 정상 종료. 대조: read_only 아니면 실행."""
+    out = {}
+    for ro in (True, False):
+        log: list = []
+        child = _make_child(ck, [[("write_db", {})]], "CHILD:DONE", log)
+        p = PATTERNS[pk]
+        reg = ToolRegistry()
+        reg.add(AgentTool("kid", child, description="sub-agent", read_only=ro))
+        parent = p.build(fake(p.script([[("kid", {"query": "go"})]], "parent-done")), reg)
+        st = await start(parent)
+        out[ro] = (log.count("write_db"), st.get("final"))
+    ok = out[True] == (0, "parent-done") and out[False] == (1, "parent-done")
+    rep.add("read_only_child", f"{pk}⊃{ck}", "read_only 자식의 쓰기 도구 거절 (대조: 아니면 실행)", ok,
+            f"read_only 실행 {out[True][0]}회 / 일반 실행 {out[False][0]}회", fix="4B.3")
+
+
 PAIR_SCENARIOS = [pair_normal, pair_child_tool_error, pair_child_garbage, pair_child_capped,
                   pair_context_to_child, pair_approval, pair_restart, pair_ask_human,
-                  pair_same_child_twice, pair_parallel_interrupts]
+                  pair_same_child_twice, pair_parallel_interrupts, pair_read_only]
 
 # --------------------------------------------------------------------------
 # TOP 시나리오 (단일 패턴)
@@ -893,6 +913,98 @@ async def ctx_read_find_and_next(rep: Report) -> None:
             f"find={found}, 다음 호출 안내={nxt}", fix="5.1")
 
 
+
+async def cmp_read_only_grandchild(rep: Report) -> None:
+    """plan ⊃ react(read_only) ⊃ react(쓰기 시도) → 손자에서도 거절."""
+    log: list = []
+    grand = _make_child("react", [[("write_db", {})]], "GRAND:DONE", log)
+    mid_reg = ToolRegistry()
+    mid_reg.add(AgentTool("grand", grand, description="grandchild"))  # 자체는 read_only 아님
+    mid = PATTERNS["react"].build(fake(_react_script([[("grand", {"query": "x"})]], "MID:DONE")),
+                                  mid_reg)
+    reg = ToolRegistry()
+    reg.add(AgentTool("mid", mid, description="child", read_only=True))
+    parent = PATTERNS["plan"].build(fake(_plan_script([[("mid", {"query": "go"})]], "parent-done")),
+                                    reg)
+    st = await start(parent)
+    ok = log.count("write_db") == 0 and st.get("final") == "parent-done"
+    rep.add("read_only_grandchild", "plan⊃react(ro)⊃react", "read_only 가 손자까지 전파", ok,
+            f"쓰기 실행 {log.count('write_db')}회", fix="4B.3")
+
+
+def _price_child(final_obj: Any) -> Any:
+    reg = ToolRegistry()
+    reg.register("get_price", lambda ticker: {"ticker": ticker, "price_usd": 231.5})
+    script = [json.dumps({"action": "tool", "tool": "get_price", "args": {"ticker": "AAPL"}}),
+              json.dumps(final_obj)]
+    return PATTERNS["react"].build(fake(script), reg)
+
+
+async def cmp_output_schema_ref(rep: Report) -> None:
+    """자식이 output_schema 대로 result 를 주면 부모 계획이 $1.price_usd 로 숫자를 꺼내 씀."""
+    schema = {"type": "object", "properties": {"price_usd": {"type": "number"}},
+              "required": ["price_usd"]}
+    child = _price_child({"action": "finish", "final": "AAPL is $231.50",
+                          "result": {"price_usd": 231.5}})
+    got: list = []
+    reg = ToolRegistry()
+    reg.add(AgentTool("researcher", child, description="finds prices", output_schema=schema))
+    reg.register("to_krw", lambda amount: got.append(amount) or amount * 1380)
+    llm = fake([{"tasks": [{"id": 1, "tool": "researcher", "args": {"query": "AAPL price"}},
+                           {"id": 2, "tool": "to_krw", "args": {"amount": "$1.price_usd"}, "deps": [1]}]},
+                {"decision": "finish", "final": "done"}])
+    st = await start(PATTERNS["plan"].build(llm, reg))
+    planner_prompt = llm.calls[0][1]
+    ok = got == [231.5] and (st.get("results") or {}).get(2) == 319470.0 and "returns:" in planner_prompt
+    rep.add("output_schema_ref", "plan⊃react", "구조화 result → $1.price_usd 로 숫자 전달, planner 에 returns 표시",
+            ok, f"to_krw 인자={got}, results[2]={(st.get('results') or {}).get(2)}", fix="4B.4")
+
+
+async def cmp_output_schema_missing(rep: Report) -> None:
+    """자식이 result 없이 문장만 주면 → 실패로 돌아오고, $1.price_usd 를 쓰는 다음 task 는 실행 안 됨."""
+    schema = {"type": "object", "properties": {"price_usd": {"type": "number"}},
+              "required": ["price_usd"]}
+    child = _price_child({"action": "finish", "final": "AAPL is $231.50"})
+    got: list = []
+    reg = ToolRegistry()
+    reg.add(AgentTool("researcher", child, description="finds prices", output_schema=schema))
+    reg.register("to_krw", lambda amount: got.append(amount) or amount * 1380)
+    llm = fake([{"tasks": [{"id": 1, "tool": "researcher", "args": {"query": "AAPL price"}},
+                           {"id": 2, "tool": "to_krw", "args": {"amount": "$1.price_usd"}, "deps": [1]}]},
+                {"decision": "finish", "final": "could not get a numeric price"}])
+    try:
+        st = await start(PATTERNS["plan"].build(llm, reg))
+        r1 = (st.get("results") or {}).get(1)
+        ok = is_failure(r1) and got == [] and st.get("final") == "could not get a numeric price"
+        obs = f"results[1] 실패={is_failure(r1)}, to_krw 실행={got}"
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("output_schema_missing", "plan⊃react", "형태에 맞는 result 없음 → 실패로 반환, 후속 task 미실행",
+            ok, obs, fix="4B.4")
+
+
+async def cmp_bad_path_ref(rep: Report) -> None:
+    """$1.nope 처럼 결과에 없는 경로 → 그 task 만 실패, 실행은 죽지 않음."""
+    reg = ToolRegistry()
+    reg.register("fetch", lambda: {"price_usd": 1.0})
+    reg.register("use", lambda x: x)
+    llm = fake([{"tasks": [{"id": 1, "tool": "fetch", "args": {}},
+                           {"id": 2, "tool": "use", "args": {"x": "$1.nope"}, "deps": [1]}]},
+                {"decision": "finish", "final": "done"}])
+    try:
+        st = await start(PATTERNS["plan"].build(llm, reg))
+        r2 = (st.get("results") or {}).get(2)
+        ok = is_failure(r2) and "no nope" in r2["error"] and st.get("final") == "done"
+        obs = _short(r2, 80)
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("bad_path_ref", "plan", "없는 경로 참조 → 해당 task 실패, 실행 계속", ok, obs, fix="4B.4")
+
+
+COMPOSE_SCENARIOS = [cmp_read_only_grandchild, cmp_output_schema_ref, cmp_output_schema_missing,
+                     cmp_bad_path_ref]
+
+
 CONTEXT_SCENARIOS = [ctx_offload, ctx_clearing, ctx_compaction, ctx_notes_survive_pause,
                      ctx_skills, ctx_tool_search, ctx_name_clash, ctx_nested_child_policy,
                      ctx_plan_results_cap, ctx_compaction_chain, ctx_read_bad_args,
@@ -900,10 +1012,217 @@ CONTEXT_SCENARIOS = [ctx_offload, ctx_clearing, ctx_compaction, ctx_notes_surviv
                      ctx_read_find_and_next]
 
 
+
+# --------------------------------------------------------------------------
+# WORKFLOW 시나리오 (prompt_chain / router / parallel / evaluator_optimizer / orchestrator_workers)
+# --------------------------------------------------------------------------
+
+WORKFLOWS = ("prompt_chain", "router", "parallel", "evaluator_optimizer", "orchestrator_workers")
+
+
+def _wf_registry(log: list) -> ToolRegistry:
+    reg = _child_registry(log)
+    reg.register("echo", lambda query: f"ECHO:{query}", description="echo the query",
+                 args_schema={"type": "object", "properties": {"query": {"type": "string"}},
+                              "required": ["query"]})
+    return reg
+
+
+def _wf_build(name: str, llm_script: list, reg: ToolRegistry, target: str, saver=None) -> Any:
+    """``name`` 패턴을 ``target`` 도구 하나에 위임하도록 구성. llm_script 는 그 패턴의 LLM 응답들."""
+    cfg: dict[str, Any] = {"checkpointer": saver}
+    if name == "prompt_chain":
+        cfg["steps"] = [{"name": "only", "tool": target}]
+    elif name == "router":
+        cfg["routes"] = {target: "the route"}
+    elif name == "parallel":
+        cfg["sections"] = [{"name": "only", "tool": target}]
+    elif name == "evaluator_optimizer":
+        cfg.update(criteria="anything", generator=target)
+    elif name == "orchestrator_workers":
+        cfg["workers"] = [target]
+    return patterns.get(name).build(llm=fake(llm_script), registry=reg, **cfg)
+
+
+def _wf_script(name: str, target: str, final: str = "WF:done") -> list:
+    """target 에 1회 위임하고 끝나는 LLM 응답 (패턴별)."""
+    return {
+        "prompt_chain": [],
+        "router": [{"route": target}],
+        "parallel": [],
+        "evaluator_optimizer": [{"pass": True, "feedback": "ok"}],
+        "orchestrator_workers": [{"subtasks": [{"worker": target, "objective": "go"}]},
+                                 {"decision": "finish", "final": final}],
+    }[name]
+
+
+def _wf_expected_final(name: str, target_out: str, final: str = "WF:done") -> str:
+    if name == "parallel":
+        return f"[only] {target_out}"
+    if name == "orchestrator_workers":
+        return final
+    return target_out
+
+
+async def wf_as_child(rep: Report, name: str) -> None:
+    """각 워크플로 패턴을 react·plan 부모의 자식(AgentTool)으로 → 부모가 그 final 을 받음."""
+    for pk in ("react", "plan"):
+        wf = _wf_build(name, _wf_script(name, "echo"), _wf_registry([]), "echo")
+        parent = _make_parent(pk, {"wf": wf}, [[("wf", {"query": "go"})]])
+        st = await start(parent)
+        got = child_output(pk, st)
+        want = _wf_expected_final(name, "ECHO:go")
+        rep.add("wf_as_child", f"{pk}⊃{name}", "패턴이 자식으로 들어가 결과를 부모에 전달",
+                got == want and st.get("final") == "parent-done", _short(got, 60), fix="6")
+
+
+async def wf_nested_hitl(rep: Report, name: str) -> None:
+    """패턴이 부모, 그 아래 react 자식이 승인 필요 도구 → 멈춤 → 승인 → 1회 실행 → 정상 종료."""
+    log: list = []
+    reg = _wf_registry(log)
+    kid = _make_child("react", [[("danger", {})]], "CHILD:OK", log)
+    reg.add(AgentTool("kid", kid, description="sub-agent"))
+    saver = InMemorySaver()
+    g = _wf_build(name, _wf_script(name, "kid"), reg, "kid", saver)
+    st = await start(g, thread="t")
+    paused = len(pending(st)) == 1 and pending(st)[0].value.get("type") == "tool_approval"
+    if paused:
+        st = await resume(g, st, lambda _: True, "t")
+    env = envelope(st)
+    ok = paused and log.count("danger") == 1 and env["status"] == "ok"
+    rep.add("wf_nested_hitl", f"{name}⊃react", "자식의 승인 요청으로 멈춤 → 승인 → 도구 1회 → 정상 종료", ok,
+            f"멈춤={paused}, 도구 {log.count('danger')}회, status={env['status']}", fix="6")
+
+
+async def wf_garbage(rep: Report, name: str) -> None:
+    """LLM 출력이 계속 깨짐 → 죽지 않고 status=error (LLM 을 안 쓰는 구성은 해당 없음)."""
+    if name in ("prompt_chain", "parallel"):
+        return
+    try:
+        g = _wf_build(name, ["not json"] * 6, _wf_registry([]), "echo")
+        env = envelope(await start(g))
+        ok = env["status"] == "error" and bool(env["error"])
+        obs = f"status={env['status']}, error={_short(env['error'], 50)}"
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("wf_llm_garbage", name, "출력이 깨져도 죽지 않고 status=error", ok, obs, fix="6")
+
+
+async def wf_specific(rep: Report) -> None:
+    # prompt_chain: LLM 단계 → 도구 단계({previous} 치환), gate 실패 시 중단
+    log: list = []
+    g = patterns.get("prompt_chain").build(llm=fake(["hello world"]), registry=_wf_registry(log), steps=[
+        {"name": "draft", "prompt": "Write about {query}"},
+        {"name": "shout", "tool": "up", "args": {"text": "{previous}"}}])
+    env = envelope(await start(g))
+    gated = patterns.get("prompt_chain").build(llm=fake(["hi"]), registry=_wf_registry(log), steps=[
+        {"name": "draft", "prompt": "Write about {query}", "gate": lambda o: "too short" if len(o) < 5 else None},
+        {"name": "shout", "tool": "write_db"}])
+    genv = envelope(await start(gated))
+    ok = (env["final"] == "HELLO WORLD" and env["status"] == "ok" and genv["status"] == "error"
+          and "too short" in genv["error"] and "write_db" not in log)
+    rep.add("chain_steps_and_gate", "prompt_chain", "LLM→도구 단계 연결, gate 실패 시 이후 단계 미실행", ok,
+            f"final={env['final']!r}, gate={genv['status']}", fix="6.1")
+
+    # router: 분류 깨짐 → fallback / fallback 없으면 error
+    reg = _wf_registry([])
+    fb = envelope(await start(patterns.get("router").build(
+        llm=fake(["junk"] * 4), registry=reg, routes={"echo": "e", "up": "u"}, fallback="echo")))
+    nofb = envelope(await start(patterns.get("router").build(
+        llm=fake([{"route": "nope"}] * 4), registry=reg, routes={"echo": "e", "up": "u"})))
+    ok = fb["final"] == "ECHO:q" and fb["status"] == "ok" and nofb["status"] == "error"
+    rep.add("router_fallback", "router", "분류 실패 → fallback 경로, fallback 없으면 status=error", ok,
+            f"fallback={fb['final']!r}, 없음={nofb['status']}", fix="6.2")
+
+    # router: 실모델이 에이전트 경로에 구조화 args 를 채움 → 그래도 에이전트는 query 를 받아야 함
+    kid = _make_child("react", [[("up", {"text": "a"})]], "CHILD:OK", [])
+    rreg = _wf_registry([])
+    rreg.add(AgentTool("kid", kid, description="agent route"))
+    renv = envelope(await start(patterns.get("router").build(
+        llm=fake([{"route": "kid", "args": {"amount": 250, "from_currency": "USD"}}]), registry=rreg,
+        routes={"kid": "agent", "echo": "echo"})))
+    rep.add("router_agent_args", "router⊃react", "에이전트 경로에 엉뚱한 args 가 와도 query 로 위임",
+            renv["status"] == "ok" and renv["final"] == "CHILD:OK",
+            f"status={renv['status']}, final={renv['final']!r}", fix="6.2")
+
+    # parallel voting: 다수결
+    answers = iter(["42", "42.", "41"])
+    vreg = ToolRegistry()
+    vreg.register("guess", lambda query: next(answers), args_schema={
+        "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]})
+    venv = envelope(await start(patterns.get("parallel").build(
+        llm=fake([]), registry=vreg, mode="voting", voter="guess", n=3)))
+    ok = venv["final"] in ("42", "42.") and (venv["result"] or {}).get("agreement") == "2/3"
+    rep.add("parallel_voting", "parallel", "3표 중 2표 일치 → 다수결 답, 일치율 2/3", ok,
+            f"final={venv['final']!r}, agreement={(venv['result'] or {}).get('agreement')}", fix="6.3")
+
+    # parallel: 두 섹션이 동시에 승인 요청 → id 매핑 재개
+    log = []
+    preg = _wf_registry(log)
+    for n in ("k1", "k2"):
+        preg.add(AgentTool(n, _make_child("react", [[("danger", {})]], f"C:{n}", log), description=n))
+    saver = InMemorySaver()
+    g = patterns.get("parallel").build(llm=fake([]), registry=preg, checkpointer=saver,
+                                       sections=[{"tool": "k1"}, {"tool": "k2"}])
+    st = await start(g, thread="t")
+    n_int = len(pending(st))
+    if n_int:
+        st = await resume(g, st, lambda _: True, "t")
+    ok = n_int == 2 and log.count("danger") == 2 and envelope(st)["status"] == "ok"
+    rep.add("parallel_two_approvals", "parallel⊃react×2", "두 섹션 동시 승인 요청 → id별 승인 → 각 1회 실행", ok,
+            f"interrupt {n_int}개, 도구 {log.count('danger')}회", fix="6.3")
+
+    # evaluator_optimizer: 2라운드 통과 + 평가자는 이전 초안을 못 봄 / 상한 → capped
+    llm = fake(["draft one", {"pass": False, "feedback": "mention X"},
+                "draft two with X", {"pass": True, "feedback": "ok"}])
+    env = envelope(await start(patterns.get("evaluator_optimizer").build(
+        llm=llm, registry=_wf_registry([]), criteria="must mention X", max_rounds=3)))
+    gen2 = llm.calls[2][1]
+    eval2 = llm.calls[3][1]
+    ok = (env["status"] == "ok" and env["final"] == "draft two with X" and "mention X" in gen2
+          and "draft one" in gen2 and "draft one" not in eval2)
+    cap = envelope(await start(patterns.get("evaluator_optimizer").build(
+        llm=fake(["d1", {"pass": False, "feedback": "no"}, "d2", {"pass": False, "feedback": "no"}]),
+        registry=_wf_registry([]), criteria="c", max_rounds=2)))
+    ok = ok and cap["status"] == "capped" and cap["final"] == "d2"
+    rep.add("evaluator_rounds", "evaluator_optimizer",
+            "피드백 반영 재생성, 평가자는 이전 초안 못 봄(깨끗한 컨텍스트), 상한 → capped", ok,
+            f"status={env['status']}, 평가자가 이전 초안 봄={'draft one' in eval2}, 상한={cap['status']}",
+            fix="6.4")
+
+    # orchestrator_workers: 브리프 전달, 워커 read-only, 추가 라운드 + 마지막 라운드 finish-only
+    log = []
+    oreg = _wf_registry(log)
+    wkid = _make_child("react", [[("write_db", {})]], "W:done", log)
+    oreg.add(AgentTool("writer", wkid, description="a worker"))
+    llm = fake([{"subtasks": [{"worker": "echo", "objective": "find A", "output_format": "one line"},
+                              {"worker": "writer", "objective": "try to write"}]},
+                {"decision": "more", "reason": "need B"},
+                {"subtasks": [{"worker": "echo", "objective": "find B"}]},
+                {"decision": "finish", "final": "A and B"}])
+    env = envelope(await start(patterns.get("orchestrator_workers").build(
+        llm=llm, registry=oreg, workers=["echo", "writer"], max_rounds=2)))
+    synth_schemas = [sc for sys_, _, sc in llm.calls if "Worker results" in _]
+    sub = (env["result"] or {}).get("subtasks") or []
+    brief_ok = any("Objective: find B" in str(x.get("result")) for x in sub)
+    ok = (env["status"] == "ok" and env["final"] == "A and B" and log.count("write_db") == 0
+          and brief_ok and "anyOf" in (synth_schemas[0] or {}) and "anyOf" not in (synth_schemas[-1] or {}))
+    rep.add("orchestrator_rounds", "orchestrator_workers",
+            "워커에 브리프 전달, 워커 쓰기 거절(read-only), more → 2라운드, 마지막 라운드 finish-only", ok,
+            f"status={env['status']}, 쓰기 {log.count('write_db')}회, 브리프={brief_ok}", fix="6.5")
+
+
+async def run_workflow_scenarios(rep: Report) -> None:
+    for name in WORKFLOWS:
+        for sc in (wf_as_child, wf_nested_hitl, wf_garbage):
+            await _guard(rep, sc, name)
+    await _guard(rep, wf_specific)
+
+
 async def run_all() -> Report:
     rep = Report()
     # 등록부의 모든 패턴이 행렬에 들어 있어야 한다 (새 패턴은 어댑터를 추가해야 통과)
-    covered = {p.registry_name for p in PATTERNS.values()}
+    covered = {p.registry_name for p in PATTERNS.values()} | set(WORKFLOWS)
     missing = sorted(set(patterns.names()) - covered)
     rep.add("registry_coverage", "-", "등록된 모든 패턴에 행렬 어댑터가 있음", not missing,
             f"누락={missing}" if missing else f"{sorted(covered)}", fix="3.3")
@@ -914,8 +1233,9 @@ async def run_all() -> Report:
         for ck in PATTERNS:
             for sc in PAIR_SCENARIOS:
                 await _guard(rep, sc, pk, ck)
-    for sc in CONTEXT_SCENARIOS:
+    for sc in CONTEXT_SCENARIOS + COMPOSE_SCENARIOS:
         await _guard(rep, sc)
+    await run_workflow_scenarios(rep)
     return rep
 
 

@@ -55,12 +55,12 @@
 | 표준 명칭 | 별칭 | 정의 | 언제 쓰나 | 9B | basic_agent | 출처 |
 |---|---|---|---|---|---|---|
 | **Single-agent** | main agent loop | 에이전트 하나 + 도구 | **기본값**. 대부분의 작업 | — | `react` / `plan_execute` 단독 | [A3][A10] 원문 |
-| **Orchestrator-subagent** | Subagents (LangChain), Supervisor (LangGraph), Manager / agents-as-tools (OpenAI), Orchestrator-workers (Anthropic workflow) | 메인 에이전트가 하위 에이전트를 **도구처럼 호출**. 대화와 종합은 메인이 맡음 | 검증, 넓은 병렬 탐색, 권한 분리, 컨텍스트 격리 | 중간 | **`AgentTool` 있음** (정적 등록). 실행 중 동적 생성은 계획 6.5 | [A3][A4][A8][L2] 원문 |
+| **Orchestrator-subagent** | Subagents (LangChain), Supervisor (LangGraph), Manager / agents-as-tools (OpenAI), Orchestrator-workers (Anthropic workflow) | 메인 에이전트가 하위 에이전트를 **도구처럼 호출**. 대화와 종합은 메인이 맡음 | 검증, 넓은 병렬 탐색, 권한 분리, 컨텍스트 격리 | 중간 | **`AgentTool` 있음** (`read_only`, `output_schema`). 동적 위임은 `orchestrator_workers` | [A3][A4][A8][L2] 원문 |
 | **Handoff** | Decentralized (OpenAI) | 대화 주도권 자체를 다른 에이전트에 넘김 | 하위 에이전트가 사용자와 **직접** 대화해야 할 때만 [A3] | — | 범위 밖 | [A3][L2] 원문 |
-| **Router** | Routing (Anthropic workflow) | 입력을 분류해 전문 경로 하나로 보냄 | 입력 유형이 뚜렷하게 나뉠 때 | 높음 (분류 작업) | 계획 6.2 | [A1][L2] 원문 |
+| **Router** | Routing (Anthropic workflow) | 입력을 분류해 전문 경로 하나로 보냄 | 입력 유형이 뚜렷하게 나뉠 때 | 높음 (분류 작업) | `router` 있음 | [A1][L2] 원문 |
 | **Hierarchical** | — | 관리자 아래 관리자가 있는 다층 구조 | 매우 큰 작업 | 낮음 | `AgentTool` 중첩으로 구성 가능 (3단 중첩은 계획 4B.5에서 검증) | 확인 안 함 |
 | **Network / Swarm** | — | 에이전트끼리 자유롭게 통신 | 근거 자료가 비권장 ("mostly a distraction") | — | 범위 밖 | [A9] 원문 |
-| **Map-reduce-and-manage** | — | 관리자가 쪼개고 자식이 실행하고 관리자가 종합 | Cognition이 실제로 쓸 만하다고 본 형태 | — | 계획 6.5 | [A9] 원문 |
+| **Map-reduce-and-manage** | — | 관리자가 쪼개고 자식이 실행하고 관리자가 종합 | Cognition이 실제로 쓸 만하다고 본 형태 | — | `orchestrator_workers` | [A9] 원문 |
 | **Smart Friend** | — | 약한 메인이 어려운 지점에서 강한 모델에게 물음 | 비용·속도와 품질의 절충 | 메인이 9B면 위험 ("언제 물을지"를 모름) | 자식마다 다른 `llm`을 쓰는 것으로 구성 가능 (계획 4B.6) | [A9] 원문 |
 
 ### 축 4. 행동을 어떤 형식으로 내나
@@ -90,11 +90,11 @@
 
 | 패턴 | 정의 | 언제 쓰나 (원문 요지) | basic_agent |
 |---|---|---|---|
-| **Prompt chaining** | 작업을 단계로 나눠 앞 단계의 출력을 다음 단계 입력으로. 단계 사이에 프로그램 검사(gate) 가능 | 고정된 하위 과제로 깔끔하게 나뉠 때. 지연을 감수하고 정확도를 얻음 | 계획 6.1 |
-| **Routing** | 입력을 분류해 전문화된 후속 처리로 보냄 | 입력 유형이 뚜렷하게 나뉘고 분류를 정확히 할 수 있을 때 | 계획 6.2 |
-| **Parallelization** | **Sectioning**: 독립 하위 과제를 병렬 실행. **Voting**: 같은 과제를 여러 번 실행해 다양한 출력을 얻음 | 속도를 위해 나누거나, 확신을 높이려 여러 관점·시도가 필요할 때 | 계획 6.3 (`plan_execute` 레벨은 도구 호출 단위의 sectioning) |
-| **Orchestrator-workers** | 중앙 LLM이 작업을 **동적으로** 나눠 워커에게 맡기고 결과를 종합 | 필요한 하위 과제를 **미리 알 수 없을 때**. Parallelization과의 차이는 하위 과제가 입력에 따라 정해진다는 점 | 계획 6.5. `plan_execute`는 도구 호출 DAG를 미리 짜는 방식이라 구분됨 |
-| **Evaluator-optimizer** | 한 LLM이 생성하고 다른 LLM이 평가·피드백하는 루프 | 평가 기준이 명확하고, 반복 개선의 가치가 측정 가능할 때 | 계획 6.4 |
+| **Prompt chaining** | 작업을 단계로 나눠 앞 단계의 출력을 다음 단계 입력으로. 단계 사이에 프로그램 검사(gate) 가능 | 고정된 하위 과제로 깔끔하게 나뉠 때. 지연을 감수하고 정확도를 얻음 | `prompt_chain` 있음 |
+| **Routing** | 입력을 분류해 전문화된 후속 처리로 보냄 | 입력 유형이 뚜렷하게 나뉘고 분류를 정확히 할 수 있을 때 | `router` 있음 |
+| **Parallelization** | **Sectioning**: 독립 하위 과제를 병렬 실행. **Voting**: 같은 과제를 여러 번 실행해 다양한 출력을 얻음 | 속도를 위해 나누거나, 확신을 높이려 여러 관점·시도가 필요할 때 | `parallel` 있음 (`mode=sectioning|voting`). `plan_execute` 레벨도 도구 호출 단위의 sectioning |
+| **Orchestrator-workers** | 중앙 LLM이 작업을 **동적으로** 나눠 워커에게 맡기고 결과를 종합 | 필요한 하위 과제를 **미리 알 수 없을 때**. Parallelization과의 차이는 하위 과제가 입력에 따라 정해진다는 점 | `orchestrator_workers` 있음 (워커 기본 읽기 전용). `plan_execute`는 도구 호출 DAG를 미리 짜는 방식이라 구분됨 |
+| **Evaluator-optimizer** | 한 LLM이 생성하고 다른 LLM이 평가·피드백하는 루프 | 평가 기준이 명확하고, 반복 개선의 가치가 측정 가능할 때 | `evaluator_optimizer` 있음 (평가자는 깨끗한 컨텍스트) |
 
 ---
 
@@ -116,7 +116,7 @@
 
 ## 5. basic_agent의 조합 규칙 (2026-11-01 측정)
 
-근거: `examples/compose_matrix.py` (73/73 PASS), 상세 결과는 `docs/baseline.md`.
+근거: `examples/compose_matrix.py` (110/110 PASS), 상세 결과는 `docs/baseline.md`.
 
 0. **등록부**: 모든 패턴은 `agent.patterns.registry`에 표준 명칭과 함께 등록된다 (`python -m agent.run --list-patterns`). 빌더 시그니처는 `build(llm=, registry=, **config)`로 통일되어 있다.
 1. **중첩**: 공통 계약(`core/contract.py`)을 지키는 그래프는 `AgentTool`로 감싸 어떤 패턴의 도구로든 넣을 수 있다. 측정한 쌍: react⊃react, react⊃plan, plan⊃react, plan⊃plan.
@@ -127,9 +127,11 @@
 2. **도구 실행**: 모든 패턴은 `core/execution.py`의 `execute_tool` 하나로 도구를 실행한다. 승인 게이트, 실패 표식(`__failure__`), interrupt 통과, 실행 기록이 패턴과 무관하게 같다.
 3. **HITL 중첩**: 자식 안의 승인 게이트와 `ask_human`은 부모 그래프를 멈춘다. 재개하면 자식이 멈춘 지점부터 이어진다. 부모에만 checkpointer를 주면 된다. 승인·거절·그래프 재생성 후 재개·같은 자식 2회 호출을 측정했다.
 4. **동시 interrupt**: `plan_execute`의 병렬 레벨에서 여러 자식이 동시에 멈추면 `aresume(graph, {interrupt_id: verdict})`로 한 번에 재개한다.
-5. **현재 한계** (계획 항목)
-   - 자식에게 컨텍스트를 넘기는 것은 부모 모델이 `context` 인자를 직접 채울 때만 된다. 부모의 history나 결과를 골라 자동으로 넘기는 기능은 없다 (4B.1)
-   - 자식을 읽기 전용으로 제한할 수 없다 (4B.3)
+5. **읽기 전용 (single writer)**: `AgentTool(read_only=True)` 안에서는 `writes=True` 도구가 거절된다. 손자까지 전파. `orchestrator_workers`의 워커는 기본 읽기 전용.
+6. **구조화 결과**: `AgentTool(output_schema=...)`이면 자식에게 그 형태의 `result`를 요청하고 그 객체를 반환한다. planner는 `returns:`를 보고 `$1.price_usd`처럼 필드를 참조할 수 있다. 형태가 맞지 않으면 실패로 돌아온다(문장이 숫자 자리에 들어가지 않음). 잘못된 경로 참조는 그 task만 실패시킨다.
+7. **워크플로 패턴의 위임 대상은 등록부의 도구**다. 서브에이전트는 `AgentTool`로 넣는다. 그래서 승인·중첩 HITL·병렬 interrupt·읽기 전용·실패 전달·trace가 모든 패턴에 똑같이 적용된다.
+8. **현재 한계**
+   - 자식에게 컨텍스트를 넘기는 것은 호출 인자의 `context`로만 된다. 부모의 history나 결과를 골라 자동으로 넘기는 기능은 없다 (4B.1)
 
 ---
 

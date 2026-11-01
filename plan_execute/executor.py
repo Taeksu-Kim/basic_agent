@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.core.execution import execute_tool
+from agent.core.execution import execute_tool, failure
 from agent.core.tools import ToolRegistry
 
 
@@ -26,6 +26,8 @@ async def run_task(payload: dict[str, Any], registry: ToolRegistry) -> dict[str,
     somehow reaches here un-gated still pauses (``inline``) rather than running.
     """
     tid = payload["id"]
+    if payload.get("arg_error"):  # its $N reference didn't resolve: fail the task, don't run it
+        return {"results": {tid: failure(payload["arg_error"])}}
     value = await execute_tool(
         registry, payload["tool"], payload.get("args", {}),
         approval="preapproved" if payload.get("preapproved") else "inline",

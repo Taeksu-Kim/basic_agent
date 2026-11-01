@@ -141,6 +141,23 @@
 
 근거 강도: 과제·조건마다 1회(temperature 0). 16과제에서 회귀 0, 큰 관찰에서 3/7 → 7/7은 방향이 일관되지만, 과제 수가 적어 다른 도메인·모델로의 일반화는 확인하지 않음.
 
+## 신규 워크플로 패턴 실모델 평가 (`--suite wf`) — 2026-11-01
+
+같은 모델·설정. 과제마다 1회. 위임 대상은 react 서브에이전트(`price_agent`, 가짜 도구).
+
+| 과제 | 패턴 | 1차 | 2차 | 비고 |
+|---|---|---|---|---|
+| router_fx / router_price | router | FAIL / FAIL | OK / OK | 1차: 모델이 **에이전트 경로에 구조화 args**(`amount`, `from_currency`)를 채워 `query`가 빠짐 → 에이전트 대상은 항상 `query`로 위임하게 수정 |
+| parallel_sections_sum | parallel (sectioning + LLM 종합) | OK | OK | |
+| parallel_voting | parallel (voting 3표) | OK | OK | |
+| evaluator_summary | evaluator_optimizer | OK | OK | 1라운드 통과 |
+| orchestrator_compare | orchestrator_workers | OK | OK | 워커 2개 + 종합 |
+| chain_price_to_krw | prompt_chain (에이전트 → 숫자 추출 gate → 환전 도구) | OK | OK | |
+| nested_structured | plan_execute + `AgentTool(output_schema)` | OK (도구 실패 1, 35.5초) | OK (실패 0, 17.2초) | 1차: planner가 `$1.price_usd` 대신 `$1` 전체를 넣음 — 시스템 프롬프트가 필드 참조 문법을 안 알려줌 → 추가 |
+| **합계** | | **6/8** | **8/8** | |
+
+planner 프롬프트 변경 후 plan_execute 일반 9과제 재확인: **9/9**. 대조: `output_schema` 없는 `nested_researcher`는 여전히 문장형 답을 숫자 인자에 넣어 1회 실패 후 복구.
+
 ## 남은 관찰
 - 같은 `thread_id`로 react를 다시 실행하면 이전 scratchpad가 누적됨 [측정: 1회차 1스텝 → 2회차 2스텝]. plan_execute는 새 계획마다 결과를 비우므로 누적 없음 [측정]. **결정: 막지 않고 문서화** (thread = 요청 1건 규약. 누적을 대화 기억으로 쓰는 경우도 있음). `react/state.py`, README에 기재
 - **실모델 기준선(0.3)**: 아직 없음. vLLM 필요

@@ -22,7 +22,9 @@ PLANNER_SYSTEM = (
     "into a DAG of tool calls. Each task has an integer id, a tool name (chosen "
     "from the available tools), an args object, and deps (ids it depends on). "
     "To feed one task's output into another, put \"$ID\" in the consumer's args; "
-    "that also implies a dependency. Emit only tasks that are necessary. Do NOT "
+    "that also implies a dependency. If a tool lists `returns` (an object), pass one "
+    "field with \"$ID.field\" (e.g. \"$1.price_usd\") rather than the whole object. "
+    "Emit only tasks that are necessary. Do NOT "
     "group tasks into stages -- just give the DAG; dependencies determine order."
 )
 

@@ -174,8 +174,16 @@ async def _run(
 ) -> None:
     spec = patterns.get(agent_type)  # aliases (e.g. "plan") resolve here
     registry = demo_registry()  # replace with real tools per application
-    if demo_hitl:
-        llm: Any = _demo_hitl_llm(spec.name)
+    wf_config: dict[str, Any] = {}
+    if spec.name in _WF_DEMOS:
+        if not demo:
+            raise SystemExit(f"{spec.name} needs pattern config; from the CLI only --demo is wired")
+        responses, wf_config = _WF_DEMOS[spec.name]
+        llm: Any = FakeLLM([r if isinstance(r, str) else json.dumps(r) for r in responses])
+        if spec.name == "orchestrator_workers":
+            registry.add(_demo_helper())
+    elif demo_hitl:
+        llm = _demo_hitl_llm(spec.name)
     elif demo:
         llm = _demo_llm(spec.name)
     else:
@@ -186,7 +194,7 @@ async def _run(
     saver = await open_async_saver(state_path) if state_path else InMemorySaver()
     thread_id = uuid.uuid4().hex[:8]
 
-    config: dict[str, Any] = {"checkpointer": saver}
+    config: dict[str, Any] = {"checkpointer": saver, **wf_config}
     if approve_plans or approve_levels:
         if spec.name != "plan_execute":
             raise SystemExit("--approve-plans / --approve-levels apply to plan_execute only")
@@ -209,6 +217,33 @@ async def _run(
 
 
 _DEMO_SCRIPTS = {"react": _demo_react_llm, "plan_execute": _demo_plan_llm}
+
+# Offline demos for the workflow patterns: (FakeLLM responses, pattern config). Their
+# delegation targets are the demo registry's tools (+ a scripted ReAct "helper").
+_WF_DEMOS: dict[str, tuple[list, dict]] = {
+    "prompt_chain": ([], {"steps": [
+        {"name": "upper", "tool": "uppercase", "args": {"text": "{query}"}},
+        {"name": "excl", "tool": "exclaim", "args": {"text": "{previous}"}}]}),
+    "router": ([{"route": "uppercase", "args": {"text": "hello agent"}}],
+               {"routes": {"uppercase": "make text uppercase", "exclaim": "add an exclamation mark"}}),
+    "parallel": ([], {"sections": [
+        {"name": "upper", "tool": "uppercase", "args": {"text": "{query}"}},
+        {"name": "excl", "tool": "exclaim", "args": {"text": "{query}"}}]}),
+    "evaluator_optimizer": (["hello agent", {"pass": False, "feedback": "make it uppercase"},
+                             "HELLO AGENT", {"pass": True, "feedback": "ok"}],
+                            {"criteria": "the text must be uppercase"}),
+    "orchestrator_workers": ([{"subtasks": [{"worker": "helper", "objective": "shout hello agent"}]},
+                              {"decision": "finish", "final": "helper said: HELLO AGENT!"}],
+                             {"workers": ["helper"]}),
+}
+
+
+def _demo_helper() -> Any:
+    """A scripted ReAct sub-agent for the orchestrator demo."""
+    from agent.core.tools import AgentTool
+
+    child = patterns.get("react").build(llm=_demo_react_llm(), registry=demo_registry())
+    return AgentTool("helper", child, description="a helper agent with text tools")
 
 
 def _demo_llm(pattern: str) -> FakeLLM:

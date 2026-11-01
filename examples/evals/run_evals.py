@@ -176,6 +176,7 @@ class Task:
     distractors: int = 0
     nested: bool = False
     docs: bool = False
+    build: Optional[Callable[[Any, list], Any]] = None  # custom graph (workflow suite)
 
 
 TASKS = [
@@ -228,7 +229,116 @@ LO_TASKS = [
          expect_number(0.31, tol=0.001), "60,000자 결과 — plan_execute 컨텍스트 초과 재현", docs=True),
 ]
 
-SUITES = {"main": TASKS, "lo": LO_TASKS}
+# ------------------------------------------------------------------ workflow suite
+
+
+def _price_agent(llm: Any, log: list, **kw: Any) -> AgentTool:
+    child = patterns.get("react").build(llm=llm, registry=build_registry(log), max_steps=4)
+    return AgentTool("price_agent", child, description="looks up stock prices, FX conversions, "
+                                                       "company facts; give it a question in `query`",
+                     **kw)
+
+
+def _wf_router(llm: Any, log: list) -> Any:
+    reg = build_registry(log)
+    reg.add(_price_agent(llm, log))
+    fx = patterns.get("react").build(llm=llm, registry=build_registry(log), max_steps=4)
+    reg.add(AgentTool("fx_agent", fx, description="currency conversion questions"))
+    return patterns.get("router").build(llm=llm, registry=reg, checkpointer=InMemorySaver(),
+                                        routes={"price_agent": "stock price questions",
+                                                "fx_agent": "currency conversion questions"})
+
+
+def _wf_sections(llm: Any, log: list) -> Any:
+    reg = ToolRegistry()
+    reg.add(_price_agent(llm, log))
+    return patterns.get("parallel").build(
+        llm=llm, registry=reg, checkpointer=InMemorySaver(), aggregate="llm",
+        sections=[{"name": t, "tool": "price_agent", "query": f"What is the current price of {t} in USD?"}
+                  for t in ("AAPL", "MSFT", "NVDA")])
+
+
+def _wf_voting(llm: Any, log: list) -> Any:
+    reg = ToolRegistry()
+    reg.add(_price_agent(llm, log))
+    return patterns.get("parallel").build(llm=llm, registry=reg, checkpointer=InMemorySaver(),
+                                          mode="voting", voter="price_agent", n=3)
+
+
+EVAL_CRITERIA = ("1) mentions the ticker NVDA; 2) states the price 135.6 USD; "
+                 "3) at most 20 words; 4) no investment advice")
+
+
+def _wf_evaluator(llm: Any, log: list) -> Any:
+    return patterns.get("evaluator_optimizer").build(
+        llm=llm, registry=ToolRegistry(), checkpointer=InMemorySaver(), criteria=EVAL_CRITERIA,
+        max_rounds=3)
+
+
+def _wf_orchestrator(llm: Any, log: list) -> Any:
+    reg = ToolRegistry()
+    reg.add(_price_agent(llm, log))
+    return patterns.get("orchestrator_workers").build(llm=llm, registry=reg,
+                                                      checkpointer=InMemorySaver(), max_workers=3)
+
+
+def _numeric_gate(out: Any) -> Optional[str]:
+    try:
+        float(str(out).replace(",", "").strip())
+        return None
+    except ValueError:
+        return f"expected a bare number, got {str(out)[:40]!r}"
+
+
+def _wf_chain(llm: Any, log: list) -> Any:
+    reg = build_registry(log)
+    reg.add(_price_agent(llm, log))
+    return patterns.get("prompt_chain").build(llm=llm, registry=reg, checkpointer=InMemorySaver(), steps=[
+        {"name": "fetch", "tool": "price_agent",
+         "args": {"query": "What is NVDA's current price in USD?"}},
+        {"name": "extract", "prompt": "Extract only the number from this text, nothing else: {fetch}",
+         "gate": _numeric_gate},
+        {"name": "krw", "tool": "convert_currency",
+         "args": {"amount": "{extract}", "from_ccy": "USD", "to_ccy": "KRW"}},
+    ])
+
+
+def _wf_nested_structured(llm: Any, log: list) -> Any:
+    reg = build_registry(log)
+    reg.add(_price_agent(llm, log, output_schema={
+        "type": "object", "properties": {"price_usd": {"type": "number"}}, "required": ["price_usd"]}))
+    return patterns.get("plan_execute").build(llm=llm, registry=reg, checkpointer=InMemorySaver())
+
+
+def _eval_check(env: dict, log: list) -> bool:
+    f = env["final"]
+    return (env["status"] == "ok" and "NVDA" in f and "135.6" in f and len(f.split()) <= 20)
+
+
+WF_TASKS = [
+    Task("router_fx", "Convert 250 USD to KRW.", expect_number(345000), "router: 환율 경로 선택",
+         build=_wf_router),
+    Task("router_price", "What is the current price of NVDA in USD?", expect_number(135.6),
+         "router: 주가 경로 선택", build=_wf_router),
+    Task("parallel_sections_sum", "What is the sum of the current prices of AAPL, MSFT and NVDA in USD?",
+         expect_number(785.3), "parallel sectioning + LLM 종합", build=_wf_sections),
+    Task("parallel_voting", "What is the current price of MSFT in USD?", expect_number(418.2),
+         "parallel voting 3표", build=_wf_voting),
+    Task("evaluator_summary", "Write a one-sentence note: NVDA's current price is 135.6 USD.",
+         _eval_check, "evaluator: 기준 4개를 통과할 때까지 수정", build=_wf_evaluator),
+    Task("orchestrator_compare",
+         "Which is higher, AAPL's or MSFT's current price, and by how many USD?",
+         lambda env, log: "MSFT" in env["final"] and expect_number(186.7)(env, log),
+         "orchestrator: 비교 → 워커 2개 + 종합", build=_wf_orchestrator),
+    Task("chain_price_to_krw", "NVDA price in KRW", expect_number(187128),
+         "prompt_chain: 에이전트 → 숫자 추출(gate) → 환전 도구", build=_wf_chain),
+    Task("nested_structured",
+         "Ask the price_agent for AAPL's current price, then convert that USD amount to KRW.",
+         expect_number(319470), "plan_execute + output_schema 자식 ($1.price_usd)",
+         build=_wf_nested_structured),
+]
+
+SUITES = {"main": TASKS, "lo": LO_TASKS, "wf": WF_TASKS}
 
 # ------------------------------------------------------------------ conditions
 
@@ -273,6 +383,8 @@ class RunResult:
 
 
 def _build(cond: Condition, task: Task, llm: Any, log: list) -> Any:
+    if task.build is not None:
+        return task.build(llm, log)
     reg = build_registry(log, distractors=task.distractors, docs=task.docs)
     cfg: dict[str, Any] = {"checkpointer": InMemorySaver()}
     if cond.pattern == "react":
@@ -331,6 +443,8 @@ async def main_async(args: argparse.Namespace) -> list[RunResult]:
     (out / "traces").mkdir(parents=True, exist_ok=True)
     tasks = [t for t in SUITES[args.suite] if not args.tasks or t.name in args.tasks]
     conds = [c for c in CONDITIONS if not args.conditions or c.name in args.conditions]
+    if args.suite == "wf":  # each workflow task builds its own pattern -> one run per task
+        conds = [Condition("workflow", "-")]
     results = []
     for task in tasks:
         for cond in conds:

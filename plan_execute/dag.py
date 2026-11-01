@@ -19,7 +19,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-_REF_RE = re.compile(r"\$(\d+)")
+# $N, optionally followed by a path into the result: $3.price_usd, $2.items[0].name
+_REF_RE = re.compile(r"\$(\d+)((?:\.[A-Za-z_]\w*|\[\d+\])*)")
+_PATH_RE = re.compile(r"\.([A-Za-z_]\w*)|\[(\d+)\]")
 
 
 class PlanError(ValueError):
@@ -76,7 +78,7 @@ def refs_in(value: Any) -> set[int]:
     """Collect all ``$N`` reference ids appearing anywhere in ``value``."""
     out: set[int] = set()
     if isinstance(value, str):
-        out.update(int(n) for n in _REF_RE.findall(value))
+        out.update(int(m.group(1)) for m in _REF_RE.finditer(value))
     elif isinstance(value, dict):
         for v in value.values():
             out |= refs_in(v)
@@ -134,6 +136,21 @@ def topological_levels(plan: Plan) -> list[list[int]]:
     return levels
 
 
+def _resolve(m: re.Match[str], results: dict[int, Any]) -> Any:
+    """Value of one ``$N[.path]`` reference (raises PlanError if it doesn't resolve)."""
+    key = int(m.group(1))
+    if key not in results:
+        raise PlanError(f"unresolved reference ${key}")
+    value = results[key]
+    for field_name, index in _PATH_RE.findall(m.group(2) or ""):
+        try:
+            value = value[field_name] if field_name else value[int(index)]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise PlanError(f"reference {m.group(0)}: no {field_name or '[' + index + ']'} "
+                            f"in result of task {key} ({type(value).__name__})") from exc
+    return value
+
+
 def substitute_args(args: Any, results: dict[int, Any]) -> Any:
     """Resolve ``$N`` references in ``args`` against ``results``.
 
@@ -144,16 +161,10 @@ def substitute_args(args: Any, results: dict[int, Any]) -> Any:
     if isinstance(args, str):
         whole = _REF_RE.fullmatch(args)
         if whole:
-            key = int(whole.group(1))
-            if key not in results:
-                raise PlanError(f"unresolved reference ${key}")
-            return results[key]
+            return _resolve(whole, results)
 
         def _repl(m: re.Match[str]) -> str:
-            key = int(m.group(1))
-            if key not in results:
-                raise PlanError(f"unresolved reference ${key}")
-            return str(results[key])
+            return str(_resolve(m, results))
 
         return _REF_RE.sub(_repl, args)
     if isinstance(args, dict):
