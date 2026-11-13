@@ -31,9 +31,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------- skills
 
@@ -68,7 +68,9 @@ def load_skills(directory: str | Path) -> list[Skill]:
 
 @dataclass(frozen=True)
 class ContextPolicy:
-    inline_chars: int = 1500             # longest observation shown inline (same as the old cap)
+    # longest observation shown inline. 스텝당 관측 상한 — 없으면 몇 스텝 만에 컨텍스트 초과 (실측).
+    # Also react's cap with no policy (was react.policy.OBS_CHAR_LIMIT).
+    inline_chars: int = 1500
     offload: bool = False                # long obs -> preview + read_observation pointer
     keep_recent: Optional[int] = None    # clear all but the last N observations
     compact_at_chars: Optional[int] = None  # summarise older steps past this many rendered chars
@@ -80,22 +82,9 @@ class ContextPolicy:
     tool_search_k: int = 5
 
     def harness_tools(self, registry: Any) -> dict[str, str]:
-        """Harness tools this policy enables -> one-line usage for the prompt."""
-        tools: dict[str, str] = {}
-        if self.offload or self.keep_recent is not None:
-            tools["read_observation"] = (
-                "read_observation(step: int, offset: int = 0, find: str = \"\"): read more of an "
-                "earlier step's output from character `offset`; or pass `find` (a word) to jump "
-                "to the passages where it appears")
-        if self.notes:
-            tools["notes_write"] = ("notes_write(text: str): save a note (progress, decisions); "
-                                    "notes stay visible in every later step")
-        if self.skills:
-            tools["load_skill"] = "load_skill(name: str): load a skill's full instructions"
-        if self.search_active(registry):
-            tools["tool_search"] = ("tool_search(query: str): find more tools by keyword; "
-                                    "found tools become available")
-        return tools
+        """Harness tools this policy enables -> one-line usage for the prompt
+        (in registration order, see :data:`HARNESS_TOOLS`)."""
+        return {t.name: t.usage for t in HARNESS_TOOLS.values() if t.enabled(self, registry)}
 
     def search_active(self, registry: Any) -> bool:
         return (self.tool_search_threshold is not None
@@ -106,8 +95,6 @@ class ContextPolicy:
         if clash:
             raise ValueError(f"registry tools {sorted(clash)} clash with harness tool names")
 
-
-HARNESS_TOOL_NAMES = ("read_observation", "notes_write", "load_skill", "tool_search")
 
 # react's default (2026-11-01, real-model evals in docs/baseline.md): just-in-time
 # reading of long observations is ON. Without it the model never read past the
@@ -150,7 +137,7 @@ def obs_text(observation: Any) -> str:
     return json.dumps(observation, default=str, ensure_ascii=False)
 
 
-def _step_line(i: int, step: dict[str, Any], body: str) -> str:
+def step_line(i: int, step: dict[str, Any], body: str) -> str:
     return (f"[{i}] tool={step.get('tool')} "
             f"args={json.dumps(step.get('args', {}), ensure_ascii=False)} -> {body}")
 
@@ -176,7 +163,7 @@ def render_steps(steps: list[dict[str, Any]], policy: ContextPolicy, *,
                 body = text[: policy.inline_chars] + "…[truncated]"
         else:
             body = text
-        lines.append(_step_line(i, step, body))
+        lines.append(step_line(i, step, body))
     return "\n".join(lines) if lines else "(no steps yet)"
 
 
@@ -211,62 +198,122 @@ def visible_tool_names(registry: Any, policy: ContextPolicy, loaded: list[str]) 
 # ---------------------------------------------------------------- harness tools
 
 
+HarnessResult = tuple[Any, dict[str, Any]]  # (observation, extra state update)
+
+
+@dataclass(frozen=True)
+class HarnessTool:
+    """A tool the loop itself handles against run state (no registry, no approval gate).
+
+    Adding one = one ``@_harness(...)`` function here. Its usage line goes into the
+    prompt when ``enabled(policy, registry)``; the composition matrix's
+    ``harness_coverage`` row fails until a scenario exercises it.
+    """
+
+    name: str
+    usage: str                                                   # one line for the prompt
+    enabled: Callable[[ContextPolicy, Any], bool]                # (policy, registry) -> shown?
+    run: Callable[[dict[str, Any], dict[str, Any], Any, ContextPolicy], HarnessResult]
+
+
+# Registration order = order of the usage lines in the prompt.
+HARNESS_TOOLS: dict[str, HarnessTool] = {}
+
+
+def _harness(name: str, usage: str, enabled: Callable[[ContextPolicy, Any], bool]) -> Callable:
+    def deco(fn: Callable[..., HarnessResult]) -> Callable[..., HarnessResult]:
+        HARNESS_TOOLS[name] = HarnessTool(name, usage, enabled, fn)
+        return fn
+    return deco
+
+
+@_harness("read_observation",
+          "read_observation(step: int, offset: int = 0, find: str = \"\"): read more of an "
+          "earlier step's output from character `offset`; or pass `find` (a word) to jump "
+          "to the passages where it appears",
+          lambda p, _reg: p.offload or p.keep_recent is not None)
+def _read_observation(args: dict[str, Any], state: dict[str, Any], registry: Any,
+                      policy: ContextPolicy) -> HarnessResult:
+    steps = state.get("scratchpad") or []
+    try:
+        step = int(args.get("step", 0))
+        offset = max(0, int(args.get("offset", 0)))
+    except (TypeError, ValueError):
+        return {"error": "read_observation needs integer step/offset"}, {}
+    if not steps:
+        return {"error": "no earlier steps to read yet"}, {}
+    if not 1 <= step <= len(steps):
+        return {"error": f"no step {step}; steps are 1..{len(steps)}"}, {}
+    text = obs_text(steps[step - 1].get("observation"))
+    find = str(args.get("find") or "").strip()
+    if find:  # jump to where the word appears (case-insensitive), a few windows
+        hits = [m.start() for m in re.finditer(re.escape(find), text, re.IGNORECASE)][:3]
+        if not hits:
+            return (f"[step {step}: '{find}' not found in its {len(text)} chars. "
+                    f"Read sequentially with read_observation(step={step}, offset=...)]"), {}
+        half = max(100, policy.inline_chars // (2 * len(hits)))
+        parts = [f"...{text[max(0, h - half): h + half]}... (at char {h})" for h in hits]
+        return f"[step {step}, matches for '{find}']\n" + "\n".join(parts), {}
+    chunk = text[offset: offset + policy.inline_chars]
+    end = offset + len(chunk)
+    # Say exactly what to call next: a real model re-read the *read result's*
+    # step number instead of the original step when this was left implicit.
+    nxt = (f" [continue: read_observation(step={step}, offset={end})]" if end < len(text)
+           else f" [end of step {step}]")
+    return f"[step {step}, chars {offset}-{end} of {len(text)}] {chunk}{nxt}", {}
+
+
+@_harness("notes_write",
+          "notes_write(text: str): save a note (progress, decisions); "
+          "notes stay visible in every later step",
+          lambda p, _reg: p.notes)
+def _notes_write(args: dict[str, Any], state: dict[str, Any], registry: Any,
+                 policy: ContextPolicy) -> HarnessResult:
+    note = str(args.get("text", "")).strip()
+    if not note:
+        return {"error": "notes_write needs non-empty text"}, {}
+    return "noted", {"notes": [note]}
+
+
+@_harness("load_skill",
+          "load_skill(name: str): load a skill's full instructions",
+          lambda p, _reg: bool(p.skills))
+def _load_skill(args: dict[str, Any], state: dict[str, Any], registry: Any,
+                policy: ContextPolicy) -> HarnessResult:
+    wanted = str(args.get("name", ""))
+    for s in policy.skills:
+        if s.name == wanted:
+            return s.body, {}
+    return {"error": f"no skill {wanted!r}; skills: {[s.name for s in policy.skills]}"}, {}
+
+
+@_harness("tool_search",
+          "tool_search(query: str): find more tools by keyword; found tools become available",
+          lambda p, reg: p.search_active(reg))
+def _tool_search(args: dict[str, Any], state: dict[str, Any], registry: Any,
+                 policy: ContextPolicy) -> HarnessResult:
+    query = str(args.get("query", "")).lower()
+    terms = [t for t in re.split(r"\W+", query) if t]
+    scored = []
+    for spec in registry.describe():
+        hay = f"{spec['name']} {spec.get('description') or ''}".lower()
+        score = sum(1 for t in terms if t in hay)
+        if score:
+            scored.append((-score, spec["name"], spec))
+    found = [s for _, _, s in sorted(scored)[: policy.tool_search_k]]
+    if not found:
+        return {"found": [], "hint": "no tool matched; try other keywords"}, {}
+    return ({"found": [{"name": s["name"], "description": s.get("description", ""),
+                        "args": s.get("args_schema")} for s in found]},
+            {"loaded_tools": [s["name"] for s in found]})
+
+
+HARNESS_TOOL_NAMES: tuple[str, ...] = tuple(HARNESS_TOOLS)
+
+
 def run_harness_tool(name: str, args: dict[str, Any], state: dict[str, Any],
-                     registry: Any, policy: ContextPolicy) -> tuple[Any, dict[str, Any]]:
+                     registry: Any, policy: ContextPolicy) -> HarnessResult:
     """Execute a harness tool against run state -> (observation, extra state update)."""
-    args = args or {}
-    if name == "read_observation":
-        steps = state.get("scratchpad") or []
-        try:
-            step = int(args.get("step", 0))
-            offset = max(0, int(args.get("offset", 0)))
-        except (TypeError, ValueError):
-            return {"error": "read_observation needs integer step/offset"}, {}
-        if not steps:
-            return {"error": "no earlier steps to read yet"}, {}
-        if not 1 <= step <= len(steps):
-            return {"error": f"no step {step}; steps are 1..{len(steps)}"}, {}
-        text = obs_text(steps[step - 1].get("observation"))
-        find = str(args.get("find") or "").strip()
-        if find:  # jump to where the word appears (case-insensitive), a few windows
-            hits = [m.start() for m in re.finditer(re.escape(find), text, re.IGNORECASE)][:3]
-            if not hits:
-                return (f"[step {step}: '{find}' not found in its {len(text)} chars. "
-                        f"Read sequentially with read_observation(step={step}, offset=...)]"), {}
-            half = max(100, policy.inline_chars // (2 * len(hits)))
-            parts = [f"...{text[max(0, h - half): h + half]}... (at char {h})" for h in hits]
-            return f"[step {step}, matches for '{find}']\n" + "\n".join(parts), {}
-        chunk = text[offset: offset + policy.inline_chars]
-        end = offset + len(chunk)
-        # Say exactly what to call next: a real model re-read the *read result's*
-        # step number instead of the original step when this was left implicit.
-        nxt = (f" [continue: read_observation(step={step}, offset={end})]" if end < len(text)
-               else f" [end of step {step}]")
-        return f"[step {step}, chars {offset}-{end} of {len(text)}] {chunk}{nxt}", {}
-    if name == "notes_write":
-        note = str(args.get("text", "")).strip()
-        if not note:
-            return {"error": "notes_write needs non-empty text"}, {}
-        return "noted", {"notes": [note]}
-    if name == "load_skill":
-        wanted = str(args.get("name", ""))
-        for s in policy.skills:
-            if s.name == wanted:
-                return s.body, {}
-        return {"error": f"no skill {wanted!r}; skills: {[s.name for s in policy.skills]}"}, {}
-    if name == "tool_search":
-        query = str(args.get("query", "")).lower()
-        terms = [t for t in re.split(r"\W+", query) if t]
-        scored = []
-        for spec in registry.describe():
-            hay = f"{spec['name']} {spec.get('description') or ''}".lower()
-            score = sum(1 for t in terms if t in hay)
-            if score:
-                scored.append((-score, spec["name"], spec))
-        found = [s for _, _, s in sorted(scored)[: policy.tool_search_k]]
-        if not found:
-            return {"found": [], "hint": "no tool matched; try other keywords"}, {}
-        return ({"found": [{"name": s["name"], "description": s.get("description", ""),
-                            "args": s.get("args_schema")} for s in found]},
-                {"loaded_tools": [s["name"] for s in found]})
-    raise KeyError(name)
+    if name not in HARNESS_TOOLS:
+        raise KeyError(name)
+    return HARNESS_TOOLS[name].run(args or {}, state, registry, policy)

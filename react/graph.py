@@ -22,6 +22,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agent.core import trace
 from agent.core.context import DEFAULT_REACT_POLICY, ContextPolicy, run_harness_tool
+from agent.core.contract import Verifier, verification_failed
 from agent.core.execution import execute_tool
 from agent.core.hitl import arun_graph, aresume_graph
 from agent.core.llm import LLMClient
@@ -29,13 +30,21 @@ from agent.core.tools import ToolRegistry
 from agent.react import policy
 from agent.react.state import ReactState
 
+REJECTED = "rejected"  # action marker: the verifier turned a finish down -> reason again
+
 
 def build_react_agent(
     *, llm: LLMClient, registry: ToolRegistry, max_steps: int = 6,
     checkpointer: Any = None, system: str | None = None,
     context_policy: ContextPolicy | None = DEFAULT_REACT_POLICY,
+    verify: Verifier | None = None,
 ) -> Any:
     """Compile a ReAct agent for a given LLM + tool registry.
+
+    ``verify`` (opt-in, :data:`agent.core.contract.Verifier`) checks the answer in code
+    when the model finishes. A rejection is not the end: the rejected answer and the
+    reason become a scratchpad step and the model reasons again. Only when no step is
+    left does the run end with ``status="error"`` (the rejected answer stays in ``final``).
 
     ``system`` appends domain guidance to the base ReAct system prompt (e.g. a
     retriever agent's query-rewriting rules).
@@ -57,8 +66,23 @@ def build_react_agent(
     harness = context_policy.harness_tools(registry) if context_policy else {}
 
     def reason_node(state: ReactState) -> dict[str, Any]:
-        return policy.reason(state, policy_llm, registry, system=system,
-                             policy=context_policy, compact_llm=compact_llm)
+        update = policy.reason(state, policy_llm, registry, system=system,
+                               policy=context_policy, compact_llm=compact_llm)
+        if verify is None or update.get("status") != "ok":
+            return update
+        problem = verify(update.get("final", ""), update.get("result"))
+        if not problem:
+            return update
+        why = verification_failed(problem)
+        if update["iteration"] >= max_steps:  # no step left to fix it: end, keep the answer
+            return {**update, "status": "error", "error": why}
+        # Not finished after all: record the rejected answer + why as a step, reason again.
+        action = update["action"]
+        step = {"thought": action.get("thought", ""), "tool": "finish",
+                "args": {"final": update["final"]}, "observation": {"error": why}}
+        trace.emit("verify", passed=False, detail=trace.clip(problem))
+        return {**update, "action": {**action, "action": REJECTED}, "status": None,
+                "final": "", "result": None, "scratchpad": [step]}
 
     async def act_node(state: ReactState) -> dict[str, Any]:
         action = state["action"]
@@ -89,13 +113,15 @@ def build_react_agent(
             return END
         if state.get("iteration", 0) >= max_steps:
             return END  # step cap reached -> stop gracefully
+        if state.get("action", {}).get("action") == REJECTED:
+            return "reason"  # verifier rejected the finish; feedback is in the scratchpad
         return "act"
 
     builder = StateGraph(ReactState)
     builder.add_node("reason", reason_node)
     builder.add_node("act", act_node)
     builder.add_edge(START, "reason")
-    builder.add_conditional_edges("reason", route, ["act", END])
+    builder.add_conditional_edges("reason", route, ["act", END] + (["reason"] if verify else []))
     builder.add_edge("act", "reason")
     return builder.compile(checkpointer=checkpointer)
 

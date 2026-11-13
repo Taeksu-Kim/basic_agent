@@ -131,7 +131,8 @@ def test_scratchpad_observation_is_truncated_in_prompt():
     from agent.react import policy
 
     big = [{"snippet": "가" * 5000}]
-    text = policy._format_scratchpad([{"tool": "t", "args": {}, "observation": big}])
+    text = policy.build_user_prompt({"query": "q", "scratchpad": [
+        {"tool": "t", "args": {}, "observation": big}]}, ToolRegistry())
     assert len(text) < 2000                 # 관측이 프롬프트를 폭파시키지 않음
     assert "truncated" in text
 

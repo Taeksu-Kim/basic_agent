@@ -20,6 +20,20 @@ async def test_decorator_registration():
     assert await reg.call("greet", {"name": "x"}) == "hi x"
 
 
+def test_decorator_takes_same_options_as_register():
+    from agent.core.execution import needs_approval
+
+    reg = ToolRegistry()
+
+    @reg.tool("publish", requires_approval=True, writes=True, output_schema={"type": "object"})
+    def publish(text):
+        return text
+
+    tool = reg.get("publish")
+    assert needs_approval(reg, "publish") and tool.writes
+    assert tool.spec()["output_schema"] == {"type": "object"}
+
+
 async def test_call_awaits_async_tool():
     reg = ToolRegistry()
 

@@ -31,13 +31,59 @@ and used as a tool inside any other pattern, and can be driven by the shared
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, Protocol, TypedDict, runtime_checkable
+import json
+from typing import Any, Callable, Literal, Optional, Protocol, TypedDict, runtime_checkable
 
 QUERY, HISTORY, CONTEXT, ITERATION = "query", "history", "context", "iteration"
 FINAL, RESULT, STATUS, ERROR = "final", "result", "status", "error"
 
 Status = Literal["ok", "error", "capped"]
 STATUSES: tuple[str, ...] = ("ok", "error", "capped")
+
+
+class ContractState(TypedDict, total=False):
+    """The contract's keys as graph state; every pattern's state extends this."""
+
+    query: str
+    history: list[Any]      # prior turns; shown to the model when non-empty
+    context: Any            # caller-provided context; shown to the model when present
+    iteration: int          # step / planning-round counter
+    final: str
+    result: Any             # optional structured payload
+    status: Optional[str]   # "ok" | "error" when the pattern ends itself; unset at END -> capped
+    error: str
+
+
+# A pattern's ``verify=``: checks the final answer in code before the run may end "ok".
+# ``(final, result) -> problem`` -- ``None`` / "" passes; a string says what is wrong and
+# is fed back to the model (react: as an observation; plan_execute: as the replan reason).
+Verifier = Callable[[str, Any], Optional[str]]
+
+
+def verification_failed(problem: str) -> str:
+    """The one wording of a verifier rejection (feedback to the model and ``error``)."""
+    return f"final answer failed verification: {problem}"
+
+
+def ended_with(error: str) -> dict[str, Any]:
+    """State update that ends a run as ``status="error"`` (the contract's failure shape)."""
+    return {STATUS: "error", ERROR: error, FINAL: ""}
+
+
+def as_text(value: Any) -> str:
+    """A value as prompt text: strings verbatim, anything else as (unicode) JSON."""
+    return value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+
+
+def render_inputs(state: dict[str, Any]) -> list[str]:
+    """Prompt sections for the contract inputs ``history`` / ``context``, each shown only
+    when present (so a prompt without them is unchanged)."""
+    parts = []
+    if state.get(HISTORY):
+        parts.append("Conversation so far:\n" + "\n".join(str(h) for h in state[HISTORY]))
+    if state.get(CONTEXT) is not None:
+        parts.append("Context from the caller:\n" + as_text(state[CONTEXT]))
+    return parts
 
 
 @runtime_checkable

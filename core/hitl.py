@@ -9,9 +9,19 @@ per-tool approval) accept the same shapes:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from langgraph.types import interrupt
+
+# ``type`` of every interrupt payload the framework raises -- what a driver (run.py's
+# console loop, a UI) dispatches on to know which verdict shape to send back.
+InterruptType = Literal["tool_approval", "tool_approvals", "plan_approval", "level_review",
+                        "question"]
+TOOL_APPROVAL: InterruptType = "tool_approval"    # one tool call       -> verdict
+TOOL_APPROVALS: InterruptType = "tool_approvals"  # plan level, N calls -> {"decisions": {task_id: verdict}}
+PLAN_APPROVAL: InterruptType = "plan_approval"    # plan_execute plan   -> verdict | {"plan": [...]}
+LEVEL_REVIEW: InterruptType = "level_review"      # plan_execute level  -> verdict
+QUESTION: InterruptType = "question"              # ask_human           -> the answer itself
 
 
 def approved(verdict: Any) -> bool:
@@ -102,4 +112,4 @@ def ask_human(question: str, options: Optional[list] = None) -> Any:
     any pattern, including several parallel plan_execute tasks asking at once:
     resume those with an ``{interrupt_id: answer}`` dict (see :func:`aresume_graph`).
     """
-    return interrupt({"type": "question", "question": question, "options": options or []})
+    return interrupt({"type": QUESTION, "question": question, "options": options or []})

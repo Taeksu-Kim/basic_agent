@@ -15,8 +15,11 @@ lazily imported, so importing ``agent`` never needs those deps or a network.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional, Protocol, runtime_checkable
+import re
+import time
+from typing import Any, Callable, Optional, Protocol, TypeVar, runtime_checkable
 
+T = TypeVar("T")
 
 # Exceptions that mean "the model's output was unusable" (not JSON, wrong shape,
 # failed validation) -- worth a retry with the error fed back. Every pattern's
@@ -25,12 +28,129 @@ from typing import Any, Optional, Protocol, runtime_checkable
 OUTPUT_ERRORS: tuple[type[Exception], ...] = (ValueError, TypeError, KeyError, AttributeError)
 
 
+class OutputError(ValueError):
+    """The model's output stayed unusable. From :func:`ask_parsed`, ``last`` is the
+    final attempt's parse error and ``attempts`` how many calls were made."""
+
+    def __init__(self, message: str, *, last: Optional[Exception] = None, attempts: int = 0) -> None:
+        super().__init__(message)
+        self.last = last
+        self.attempts = attempts
+
+
+_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_OBJECT_OR_LIST_RE = re.compile(r"(\{.*\}|\[.*\])", re.DOTALL)
+
+
+def extract_json(text: str, *, what: str = "output", allow_list: bool = False) -> Any:
+    """Parse JSON from a model response, tolerating prose around it (seen with real
+    models: '생각: ... {json} 끝.'). Falls back to the outermost ``{...}`` span (or
+    ``{...}``/``[...]``, whichever starts first, with ``allow_list``). One parser for
+    every pattern -- four private copies used to drift."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = (_OBJECT_OR_LIST_RE if allow_list else _OBJECT_RE).search(text)
+    if not m:
+        raise OutputError(f"no JSON found in {what}: {text[:200]!r}")
+    return json.loads(m.group(0))
+
+
+def ask_parsed(
+    llm: "LLMClient",
+    system: str,
+    user: str,
+    parse: Callable[[str], T],
+    *,
+    schema: Optional[dict] = None,
+    retries: int = 1,
+    what: str = "output",
+    hint: str = "Emit valid JSON.",
+    first: Optional[Callable[[], tuple[str, str]]] = None,
+) -> T:
+    """Call the model and return ``parse(output)``; the one retry loop every pattern uses.
+
+    Output that ``parse`` rejects (any of :data:`OUTPUT_ERRORS`) is retried ``retries``
+    times with ``[Your previous <what> was invalid: <error>. <hint>]`` appended, so the
+    model can self-correct. After that :class:`OutputError` is raised (``last`` = the
+    final parse error). :class:`ContextOverflowError` is never retried here (the same
+    prompt would overflow again) -- it propagates for the caller to end the run.
+
+    ``first``: produce the first attempt's ``(output, user_prompt)`` some other way --
+    planner/joiner pass :func:`agent.core.context.complete_fitting` so an overflowing
+    prompt is re-rendered once; retries then build on the prompt that was used.
+    """
+    last: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        if attempt == 0 and first is not None:
+            text, user = first()
+        else:
+            text = llm.complete(system, user, schema=schema)
+        try:
+            return parse(text)
+        except OUTPUT_ERRORS as exc:  # incl. JSONDecodeError from a brace-y non-JSON reply
+            last = exc
+            user = f"{user}\n\n[Your previous {what} was invalid: {exc}. {hint}]"
+    raise OutputError(f"no valid {what} after {retries + 1} attempts: {last}",
+                      last=last, attempts=retries + 1)
+
+
 class ContextOverflowError(RuntimeError):
     """The prompt (+ requested output) exceeds the model's context window.
 
     Raised instead of a generic HTTP error so callers can shrink the prompt and
     retry, or end the run gracefully -- an unhandled overflow used to crash the run
     (plan_execute joiner with a 60k-char tool result, 2026-11-01)."""
+
+
+class LLMUnavailableError(RuntimeError):
+    """The model server stayed unreachable / overloaded after the client's retries.
+
+    Deliberately *not* turned into ``status=error``: it is an infrastructure failure,
+    not the agent's, and with a checkpointer the run can be resumed from its last
+    completed step (``graph.ainvoke(None, config)``) once the server is back."""
+
+
+TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})  # worth retrying; other 4xx are not
+MAX_RETRY_WAIT = 30.0  # cap on a server-sent Retry-After (seconds)
+
+
+def _retry_after(resp: Any) -> Optional[float]:
+    try:
+        return min(float(resp.headers.get("Retry-After")), MAX_RETRY_WAIT)
+    except (TypeError, ValueError):  # absent, or an HTTP-date we don't parse
+        return None
+
+
+# Server/SDK error texts that mean "context window exceeded" (one list for every client --
+# OpenAICompatLLM used to check only the first one).
+_OVERFLOW_HINTS = ("maximum context length", "context_length_exceeded", "prompt is too long",
+                   "context window", "too many tokens")
+
+
+def _overflow_text(text: str) -> bool:
+    text = text.lower()
+    return any(h in text for h in _OVERFLOW_HINTS)
+
+
+# Request defaults for every client (override per key with ``sampling``). max_tokens 기본
+# 상한: 미설정 시 소형 모델의 반복 폭주가 컨텍스트를 다 먹고 JSON이 중간에 잘리는 사고가 난다 (실측).
+DEFAULT_SAMPLING: dict[str, Any] = {"temperature": 0, "max_tokens": 1024}
+
+
+def with_guidance(base: str, guidance: Optional[str]) -> str:
+    """A pattern's built-in system prompt plus the caller's domain guidance (each builder's
+    ``system=``). Appended *after* the base so the pattern's output protocol stays in force;
+    ``None``/empty leaves the base unchanged."""
+    return f"{base}\n\n{guidance}" if guidance else base
+
+
+def with_schema_instruction(system: str, schema: dict) -> str:
+    """System prompt plus the schema as an instruction -- for providers/modes without
+    native structured output; the patterns' parse-and-retry handles what slips through."""
+    return (f"{system}\n\nRespond with ONLY a JSON value matching this JSON schema "
+            f"(no prose, no code fences):\n{json.dumps(schema, ensure_ascii=False)}")
 
 
 @runtime_checkable
@@ -76,14 +196,20 @@ class OpenAICompatLLM:
         api_key: str = "not-needed",
         timeout: float = 120.0,
         sampling: Optional[dict] = None,
+        max_retries: int = 2,
+        backoff: float = 1.0,
     ) -> None:
+        """``max_retries``: extra attempts on a transient failure (timeout, connection
+        error, HTTP 429 / 5xx), waiting ``backoff * 2**i`` seconds (or the server's
+        ``Retry-After``, capped at :data:`MAX_RETRY_WAIT`). The SDK-based clients get the
+        same from their SDK; this one talks HTTP directly, so it has to do it itself."""
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
-        # max_tokens 기본 상한: 미설정 시 소형 모델의 반복 폭주가 컨텍스트를
-        # 다 먹고 JSON이 중간에 잘리는 사고가 난다 (실측). sampling으로 덮어쓰기.
-        self.sampling = {"temperature": 0, "max_tokens": 1024, **(sampling or {})}
+        self.sampling = {**DEFAULT_SAMPLING, **(sampling or {})}
+        self.max_retries = max_retries
+        self.backoff = backoff
         import threading
 
         self._local = threading.local()  # per-thread: parallel nodes call from several threads
@@ -110,13 +236,29 @@ class OpenAICompatLLM:
                 "type": "json_schema",
                 "json_schema": {"name": "response", "schema": schema, "strict": True},
             }
-        resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=self.timeout,
-        )
-        if resp.status_code == 400 and "maximum context length" in resp.text:
+        last = ""
+        for attempt in range(self.max_retries + 1):
+            if attempt:
+                time.sleep(wait)
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=self.timeout,
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last, wait = f"{type(exc).__name__}: {exc}", self.backoff * 2 ** attempt
+                continue
+            if resp.status_code in TRANSIENT_HTTP:
+                last = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                wait = _retry_after(resp) or self.backoff * 2 ** attempt
+                continue
+            break
+        else:
+            raise LLMUnavailableError(
+                f"LLM unreachable after {self.max_retries + 1} attempts: {last}")
+        if resp.status_code == 400 and _overflow_text(resp.text):
             raise ContextOverflowError(f"LLM context overflow: {resp.text[:300]}")
         if resp.status_code >= 400:
             # surface the server's reason -- a bare 400 is undebuggable
@@ -141,14 +283,20 @@ class AnthropicLLM:
         import anthropic  # lazy
 
         if schema is not None:
-            system = f"{system}\n\nRespond with JSON matching this schema:\n{json.dumps(schema, ensure_ascii=False)}"
+            system = with_schema_instruction(system, schema)
         client = anthropic.Anthropic()
-        msg = client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
+        try:
+            msg = client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+        except Exception as exc:  # noqa: BLE001 -- map overflow, re-raise everything else
+            # unmapped, an overflow crashed the run instead of ending it with status=error
+            if _is_overflow(exc):
+                raise ContextOverflowError(f"LLM context overflow (anthropic): {exc}") from exc
+            raise
         return "".join(block.text for block in msg.content if block.type == "text")
 
 
@@ -161,10 +309,6 @@ class AnthropicLLM:
 # must stay EMPTY -- and drops ``const`` into the description. Native mode would let
 # the model call tools only without arguments, so these default to "prompt" mode.
 PROMPT_SCHEMA_PROVIDERS = frozenset({"anthropic", "azureanthropic", "vertexaianthropic"})
-
-_OVERFLOW_HINTS = ("maximum context length", "context_length_exceeded", "prompt is too long",
-                   "context window", "too many tokens")
-
 
 class AnyLLMClient:
     """Any provider through mozilla-ai **any-llm** (optional: ``pip install 'any-llm-sdk[<provider>]'``).
@@ -216,7 +360,7 @@ class AnyLLMClient:
         self.structured = (("prompt" if provider in PROMPT_SCHEMA_PROVIDERS else "native")
                            if structured == "auto" else structured)
         self.strict = strict
-        self.sampling = {"temperature": 0, "max_tokens": 1024, **(sampling or {})}
+        self.sampling = {**DEFAULT_SAMPLING, **(sampling or {})}
         self.extra_body = extra_body
         kw = dict(client_kwargs or {})
         if provider == "openai_compatible":
@@ -241,8 +385,7 @@ class AnyLLMClient:
             kwargs["response_format"] = {"type": "json_schema", "json_schema": {
                 "name": "response", "schema": schema, "strict": self.strict}}
         elif schema is not None:
-            system = (f"{system}\n\nRespond with ONLY a JSON value matching this JSON schema "
-                      f"(no prose, no code fences):\n{json.dumps(schema, ensure_ascii=False)}")
+            system = with_schema_instruction(system, schema)
         try:
             resp = self._llm.completion(
                 model=self.model,
@@ -267,5 +410,4 @@ def _is_overflow(exc: Exception) -> bool:
             return True
     except ImportError:  # pragma: no cover
         pass
-    text = str(exc).lower()
-    return any(h in text for h in _OVERFLOW_HINTS)
+    return _overflow_text(str(exc))

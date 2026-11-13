@@ -165,6 +165,7 @@ START ─▶ reason ─(route)─▶ act ─▶ reason ─▶ … ─▶ END   (
 |---|---|
 | `core/llm.py` *(공유)* | `LLMClient` 프로토콜; `FakeLLM`(테스트); `OpenAICompatLLM`(vLLM), `AnthropicLLM`, `AnyLLMClient`(any-llm, 선택); `ContextOverflowError` |
 | `core/tools.py` *(공유)* | `BaseTool`/`FunctionTool`/`AgentTool` + `ToolRegistry` — task가 라우팅되는 실행 단위 |
+| `prompts.py` | 모든 패턴의 내장 프롬프트(출력 규약). 도메인 지침은 각 빌더의 `system=`으로 뒤에 덧붙인다 |
 | `plan_execute/dag.py` | `Task`/`Plan`, 검증, `topological_levels`, `$N` 치환 (순수) |
 | `plan_execute/orchestrator/planner.py` | *(판단)* query → DAG (JSON 스키마 강제) + 레벨 계산 |
 | `plan_execute/orchestrator/joiner.py` | *(판단)* finish / replan 분류기 |

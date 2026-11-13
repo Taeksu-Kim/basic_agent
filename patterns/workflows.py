@@ -11,22 +11,28 @@ every delegation goes through :func:`agent.core.execution.execute_tool`.
 Every graph honours :mod:`agent.core.contract` (input ``query``/``history``/
 ``context``; output ``final``/``result``/``status``/``error``), so each pattern can
 itself be wrapped in an ``AgentTool`` and nested anywhere.
+
+Every builder takes ``system=``: domain guidance appended to each of its LLM calls'
+built-in prompt (:mod:`agent.prompts`), the same as react / plan_execute.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from collections import Counter
-from typing import Annotated, Any, Callable, Optional, TypedDict
+from typing import Annotated, Any, Callable, Optional
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from agent.core import trace
+from agent.core.contract import ContractState, as_text, ended_with
 from agent.core.execution import execute_tool, is_failure, read_only_scope
-from agent.core.llm import OUTPUT_ERRORS, LLMClient
+from agent.core.llm import (ContextOverflowError, LLMClient, OutputError, ask_parsed, extract_json,
+                            with_guidance)
 from agent.core.tools import AgentTool, ToolRegistry
+from agent.prompts import (CHAIN_SYSTEM, EVAL_SYSTEM, GEN_SYSTEM, ORCH_SYSTEM, ROUTER_SYSTEM,
+                           SYNTH_FINAL_NOTE, SYNTH_ORCH_SYSTEM, SYNTH_SYSTEM)
 
 
 class PatternError(ValueError):
@@ -36,40 +42,38 @@ class PatternError(ValueError):
 # ------------------------------------------------------------------ shared helpers
 
 
-def _extract_json(text: str) -> Any:
+def _complete(llm: LLMClient, system: str, user: str, schema: Optional[dict] = None) -> str:
+    """``llm.complete``, with a context-window overflow turned into :class:`PatternError`
+    so the node ends the run with ``status=error`` -- an uncaught overflow used to
+    crash every workflow pattern (react/plan_execute already ended gracefully)."""
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            raise PatternError(f"no JSON found in output: {text[:200]!r}")
-        return json.loads(m.group(0))
+        return llm.complete(system, user, schema=schema)
+    except ContextOverflowError as exc:
+        raise PatternError(f"prompt exceeds the context window: {exc}") from exc
 
 
 def ask_json(llm: LLMClient, system: str, user: str, schema: dict, *,
              check: Callable[[Any], None] = lambda _: None, retries: int = 1, what: str = "output") -> dict:
-    """One structured LLM call; malformed output is retried with the error fed back."""
-    last: Exception | None = None
-    for _ in range(retries + 1):
-        text = llm.complete(system, user, schema=schema)
-        try:
-            data = _extract_json(text)
-            if not isinstance(data, dict):
-                raise PatternError(f"expected a JSON object, got {type(data).__name__}")
-            check(data)
-            return data
-        except OUTPUT_ERRORS as exc:
-            last = exc
-            user = f"{user}\n\n[Your previous {what} was invalid: {exc}. Emit valid JSON.]"
-    raise PatternError(f"no valid {what} after {retries + 1} attempts: {last}")
+    """One structured LLM call; malformed output is retried with the error fed back.
+    A context-window overflow is not retried (same prompt) -- it raises PatternError."""
+    def parse(text: str) -> dict:
+        data = extract_json(text)
+        if not isinstance(data, dict):
+            raise PatternError(f"expected a JSON object, got {type(data).__name__}")
+        check(data)
+        return data
+    try:
+        return ask_parsed(llm, system, user, parse, schema=schema, retries=retries, what=what)
+    except ContextOverflowError as exc:
+        raise PatternError(f"prompt exceeds the context window: {exc}") from exc
+    except OutputError as exc:
+        raise PatternError(str(exc)) from exc
 
 
 def text_of(value: Any) -> str:
     if is_failure(value):
         return f"[failed: {value.get('error') or value.get('denied')}]"
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, default=str, ensure_ascii=False)
+    return as_text(value)
 
 
 def _accepts(registry: ToolRegistry, name: str, arg: str) -> bool:
@@ -78,6 +82,14 @@ def _accepts(registry: ToolRegistry, name: str, arg: str) -> bool:
         return True  # sub-agents take query (+ context, extra state keys)
     props = ((tool.args_schema or {}).get("properties") or {})
     return arg in props
+
+
+def _require_tools(registry: ToolRegistry, names: list[str], what: str) -> None:
+    """Fail at build time on a configured tool that isn't registered -- it used to pass
+    the build and crash the run with ToolError at the first delegation."""
+    unknown = [n for n in names if not registry.has(n)]
+    if unknown:
+        raise ValueError(f"{what}: unknown tools {unknown}; registered: {registry.names()}")
 
 
 def delegate_args(registry: ToolRegistry, name: str, query: str, *,
@@ -117,34 +129,17 @@ def _merge(a: dict | None, b: dict | None) -> dict:
     return out
 
 
-class _Base(TypedDict, total=False):
-    query: str
-    history: list[Any]
-    context: Any
-    iteration: int
-    final: str
-    result: Any
-    status: Optional[str]
-    error: str
-
-
-def _ended_with(error: str) -> dict[str, Any]:
-    return {"status": "error", "error": error, "final": ""}
-
-
 # ------------------------------------------------------------------ prompt chaining
 
 
-CHAIN_SYSTEM = "You are one step of a fixed multi-step pipeline. Do exactly what this step asks."
 
-
-class ChainState(_Base, total=False):
+class ChainState(ContractState, total=False):
     step: int
     outputs: Annotated[dict[str, Any], _merge]
 
 
 def build_prompt_chain(*, llm: LLMClient, registry: ToolRegistry, steps: list[dict],
-                       checkpointer: Any = None) -> Any:
+                       checkpointer: Any = None, system: Optional[str] = None) -> Any:
     """Prompt chaining: run ``steps`` in order, each seeing the previous outputs.
 
     A step is ``{"name": ..., "prompt": "...{query}...{previous}...{<step name>}"}``
@@ -156,6 +151,7 @@ def build_prompt_chain(*, llm: LLMClient, registry: ToolRegistry, steps: list[di
     """
     if not steps:
         raise ValueError("prompt_chain needs at least one step")
+    _require_tools(registry, [s["tool"] for s in steps if "tool" in s], "prompt_chain steps")
     step_llm = trace.traced(llm, "prompt_chain.step")
 
     async def step_node(state: ChainState) -> dict[str, Any]:
@@ -171,15 +167,18 @@ def build_prompt_chain(*, llm: LLMClient, registry: ToolRegistry, steps: list[di
             out = await execute_tool(registry, spec["tool"],
                                      args or delegate_args(registry, spec["tool"], state["query"]))
             if is_failure(out):
-                return {**_ended_with(f"step {name!r} failed: {text_of(out)}"), "outputs": {name: out}}
+                return {**ended_with(f"step {name!r} failed: {text_of(out)}"), "outputs": {name: out}}
         else:
-            out = step_llm.complete(CHAIN_SYSTEM, _fmt(spec["prompt"], values)).strip()
+            try:
+                out = _complete(step_llm, with_guidance(CHAIN_SYSTEM, system), _fmt(spec["prompt"], values)).strip()
+            except PatternError as exc:
+                return {**ended_with(f"step {name!r}: {exc}"), "outputs": {name: ""}}
         gate = spec.get("gate")
         problem = gate(out) if gate else None
         update: dict[str, Any] = {"outputs": {name: out}, "step": i + 1, "iteration": i + 1,
                                   "status": None}
         if problem:
-            update.update(_ended_with(f"gate after step {name!r}: {problem}"))
+            update.update(ended_with(f"gate after step {name!r}: {problem}"))
         elif i + 1 == len(steps):
             update.update(final=text_of(out), status="ok",
                           result={**outputs, name: out})
@@ -198,20 +197,16 @@ def build_prompt_chain(*, llm: LLMClient, registry: ToolRegistry, steps: list[di
 # ------------------------------------------------------------------ routing
 
 
-ROUTER_SYSTEM = (
-    "You are a router. Pick the ONE route best suited to handle the user's request. "
-    "If the chosen route needs arguments other than the request itself, provide them in args."
-)
 
-
-class RouterState(_Base, total=False):
+class RouterState(ContractState, total=False):
     route: str
     route_args: dict[str, Any]
     route_reason: str
 
 
 def build_router(*, llm: LLMClient, registry: ToolRegistry, routes: Optional[dict[str, str]] = None,
-                 fallback: Optional[str] = None, checkpointer: Any = None) -> Any:
+                 fallback: Optional[str] = None, checkpointer: Any = None,
+                 system: Optional[str] = None) -> Any:
     """Routing: classify the request, hand it to exactly one route.
 
     ``routes`` maps a registry tool name to when to use it (default: every tool,
@@ -222,6 +217,7 @@ def build_router(*, llm: LLMClient, registry: ToolRegistry, routes: Optional[dic
     names = list(routes) if routes else registry.names()
     if not names:
         raise ValueError("router needs at least one route")
+    _require_tools(registry, names + ([fallback] if fallback else []), "router routes")
     desc = routes or {n: registry.get(n).description for n in names}
     route_llm = trace.traced(llm, "router.classify")
     schema = {"type": "object",
@@ -239,10 +235,10 @@ def build_router(*, llm: LLMClient, registry: ToolRegistry, routes: Optional[dic
             if d.get("route") not in names:
                 raise PatternError(f"route must be one of {names}")
         try:
-            d = ask_json(route_llm, ROUTER_SYSTEM, user, schema, check=check, what="route")
+            d = ask_json(route_llm, with_guidance(ROUTER_SYSTEM, system), user, schema, check=check, what="route")
         except PatternError as exc:
             if fallback is None:
-                return _ended_with(str(exc))
+                return ended_with(str(exc))
             d = {"route": fallback, "reason": f"fallback ({exc})"}
         return {"route": d["route"], "route_args": d.get("args") or {},
                 "route_reason": d.get("reason", ""), "status": None, "iteration": 1}
@@ -252,7 +248,7 @@ def build_router(*, llm: LLMClient, registry: ToolRegistry, routes: Optional[dic
         out = await execute_tool(registry, name, delegate_args(
             registry, name, state["query"], context=state.get("context"), args=state.get("route_args")))
         if is_failure(out):
-            return _ended_with(f"route {name!r} failed: {text_of(out)}")
+            return ended_with(f"route {name!r} failed: {text_of(out)}")
         return {"final": text_of(out), "result": None if isinstance(out, str) else out, "status": "ok"}
 
     def after_classify(state: RouterState) -> str:
@@ -270,11 +266,8 @@ def build_router(*, llm: LLMClient, registry: ToolRegistry, routes: Optional[dic
 # ------------------------------------------------------------------ parallelization
 
 
-SYNTH_SYSTEM = ("Combine the partial results below into one answer to the user's request. "
-                "Use only what the results say; note any part that failed.")
 
-
-class ParallelState(_Base, total=False):
+class ParallelState(ContractState, total=False):
     branches: Annotated[dict[int, Any], _merge]
 
 
@@ -284,7 +277,8 @@ def _norm(text: str) -> str:
 
 def build_parallel(*, llm: LLMClient, registry: ToolRegistry, mode: str = "sectioning",
                    sections: Optional[list[dict]] = None, voter: Optional[str] = None,
-                   n: int = 3, aggregate: Optional[str] = None, checkpointer: Any = None) -> Any:
+                   n: int = 3, aggregate: Optional[str] = None, checkpointer: Any = None,
+                   system: Optional[str] = None) -> Any:
     """Parallelization, two variants.
 
     * ``mode="sectioning"``: ``sections = [{"name", "tool", "query": "...{query}..."}]``
@@ -310,6 +304,7 @@ def build_parallel(*, llm: LLMClient, registry: ToolRegistry, mode: str = "secti
         aggregate = aggregate or "majority"
     else:
         raise ValueError(f"unknown mode {mode!r}")
+    _require_tools(registry, [p["tool"] for p in plan], f"parallel {mode}")
     synth_llm = trace.traced(llm, "parallel.aggregate")
 
     def fan_out(state: ParallelState) -> list[Send]:
@@ -331,7 +326,7 @@ def build_parallel(*, llm: LLMClient, registry: ToolRegistry, mode: str = "secti
         named = {plan[i]["name"]: outs.get(i) for i in range(len(plan))}
         ok = {k: v for k, v in named.items() if not is_failure(v)}
         if not ok:
-            return {**_ended_with("all branches failed: " + "; ".join(
+            return {**ended_with("all branches failed: " + "; ".join(
                 f"{k}: {text_of(v)}" for k, v in named.items())), "result": named}
         if aggregate == "majority":
             votes = Counter(_norm(text_of(v)) for v in ok.values())
@@ -342,7 +337,10 @@ def build_parallel(*, llm: LLMClient, registry: ToolRegistry, mode: str = "secti
                                "branches": named}}
         if aggregate == "llm":
             parts = "\n\n".join(f"[{k}] {text_of(v)}" for k, v in named.items())
-            final = synth_llm.complete(SYNTH_SYSTEM, f"Request: {state['query']}\n\nResults:\n{parts}")
+            try:
+                final = _complete(synth_llm, with_guidance(SYNTH_SYSTEM, system), f"Request: {state['query']}\n\nResults:\n{parts}")
+            except PatternError as exc:
+                return {**ended_with(f"aggregate: {exc}"), "result": named}
             return {"final": final.strip(), "status": "ok", "iteration": 1, "result": named}
         return {"final": "\n\n".join(f"[{k}] {text_of(v)}" for k, v in named.items()),
                 "status": "ok", "iteration": 1, "result": named}
@@ -359,16 +357,12 @@ def build_parallel(*, llm: LLMClient, registry: ToolRegistry, mode: str = "secti
 # ------------------------------------------------------------------ evaluator-optimizer
 
 
-GEN_SYSTEM = ("Produce the requested output. If evaluator feedback on a previous draft is given, "
-              "revise the draft to address every point. Output only the result.")
-EVAL_SYSTEM = ("You are a strict evaluator. Judge the draft ONLY against the criteria. Pass it only "
-               "if every criterion is met; otherwise give concrete, actionable feedback.")
 EVAL_SCHEMA = {"type": "object",
                "properties": {"pass": {"type": "boolean"}, "feedback": {"type": "string"}},
                "required": ["pass", "feedback"]}
 
 
-class EvalOptState(_Base, total=False):
+class EvalOptState(ContractState, total=False):
     draft: Any
     feedback: str
     rounds: Annotated[list[dict[str, Any]], lambda a, b: (a or []) + (b or [])]
@@ -376,7 +370,7 @@ class EvalOptState(_Base, total=False):
 
 def build_evaluator_optimizer(*, llm: LLMClient, registry: ToolRegistry, criteria: str,
                               generator: Optional[str] = None, max_rounds: int = 3,
-                              checkpointer: Any = None) -> Any:
+                              checkpointer: Any = None, system: Optional[str] = None) -> Any:
     """Evaluator-optimizer: generate -> evaluate against ``criteria`` -> revise, until
     the evaluator passes it or ``max_rounds`` is reached.
 
@@ -386,6 +380,7 @@ def build_evaluator_optimizer(*, llm: LLMClient, registry: ToolRegistry, criteri
     see how the draft was made, which is the point. Passing -> ``status=ok``; never
     passing within the cap -> ``status=capped`` with the last draft as ``final``.
     """
+    _require_tools(registry, [generator] if generator else [], "evaluator_optimizer generator")
     gen_llm = trace.traced(llm, "evaluator_optimizer.generate")
     eval_llm = trace.traced(llm, "evaluator_optimizer.evaluate")
 
@@ -399,19 +394,22 @@ def build_evaluator_optimizer(*, llm: LLMClient, registry: ToolRegistry, criteri
             out = await execute_tool(registry, generator,
                                      delegate_args(registry, generator, state["query"], context=ctx))
             if is_failure(out):
-                return _ended_with(f"generator {generator!r} failed: {text_of(out)}")
+                return ended_with(f"generator {generator!r} failed: {text_of(out)}")
         else:
             user = f"Task: {state['query']}\n\nCriteria: {criteria}" + (f"\n\n{revise}" if revise else "")
-            out = gen_llm.complete(GEN_SYSTEM, user).strip()
+            try:
+                out = _complete(gen_llm, with_guidance(GEN_SYSTEM, system), user).strip()
+            except PatternError as exc:
+                return ended_with(f"generator: {exc}")
         return {"draft": out, "iteration": int(state.get("iteration", 0)) + 1, "status": None}
 
     def evaluate(state: EvalOptState) -> dict[str, Any]:
         user = (f"Task: {state['query']}\n\nCriteria: {criteria}\n\n"
                 f"Draft:\n{text_of(state['draft'])}")
         try:
-            d = ask_json(eval_llm, EVAL_SYSTEM, user, EVAL_SCHEMA, what="evaluation")
+            d = ask_json(eval_llm, with_guidance(EVAL_SYSTEM, system), user, EVAL_SCHEMA, what="evaluation")
         except PatternError as exc:
-            return _ended_with(str(exc))
+            return ended_with(str(exc))
         rnd = {"round": state.get("iteration", 0), "pass": bool(d["pass"]),
                "feedback": d.get("feedback", "")}
         update: dict[str, Any] = {"feedback": rnd["feedback"], "rounds": [rnd]}
@@ -444,22 +442,7 @@ def build_evaluator_optimizer(*, llm: LLMClient, registry: ToolRegistry, criteri
 # ------------------------------------------------------------------ orchestrator-workers
 
 
-ORCH_SYSTEM = (
-    "You are an orchestrator. Break the request into the subtasks needed and assign each to a "
-    "worker. For each subtask write a clear brief: objective, the output format you need back, "
-    "and boundaries (what NOT to do, to avoid overlap with other subtasks). Scale effort to the "
-    "request: a simple lookup needs 1 subtask; comparisons need one per item compared. Never "
-    "create two subtasks that do the same work."
-)
-SYNTH_ORCH_SYSTEM = (
-    "You are the orchestrator. Using the workers' results, answer the user's request. If a "
-    "needed piece is missing and another round of subtasks would get it, ask for more; "
-    "otherwise finish, stating plainly anything that could not be found."
-)
-SYNTH_FINAL_NOTE = "\n\nThis is the last round: you must finish now."
-
-
-class OrchState(_Base, total=False):
+class OrchState(ContractState, total=False):
     subtasks: list[dict[str, Any]]
     work: Annotated[dict[int, Any], _merge]
     history_rounds: Annotated[list[dict[str, Any]], lambda a, b: (a or []) + (b or [])]
@@ -469,7 +452,7 @@ class OrchState(_Base, total=False):
 def build_orchestrator_workers(*, llm: LLMClient, registry: ToolRegistry,
                                workers: Optional[list[str]] = None, max_workers: int = 4,
                                max_rounds: int = 2, read_only_workers: bool = True,
-                               checkpointer: Any = None) -> Any:
+                               checkpointer: Any = None, system: Optional[str] = None) -> Any:
     """Orchestrator-workers (dynamic): the orchestrator decides the subtasks at run
     time (unlike plan_execute's fixed tool-call DAG), hands each to a worker with a
     brief (objective / output format / boundaries), workers run in parallel, and the
@@ -483,6 +466,7 @@ def build_orchestrator_workers(*, llm: LLMClient, registry: ToolRegistry,
     names = workers or registry.names()
     if not names:
         raise ValueError("orchestrator_workers needs at least one worker")
+    _require_tools(registry, names, "orchestrator_workers workers")
     orch_llm = trace.traced(llm, "orchestrator_workers.plan")
     synth_llm = trace.traced(llm, "orchestrator_workers.synthesize")
     plan_schema = {"type": "object", "properties": {"subtasks": {
@@ -518,9 +502,9 @@ def build_orchestrator_workers(*, llm: LLMClient, registry: ToolRegistry,
             if bad:
                 raise PatternError(f"unknown workers {bad}; workers: {names}")
         try:
-            d = ask_json(orch_llm, ORCH_SYSTEM, user, plan_schema, check=check, what="subtask plan")
+            d = ask_json(orch_llm, with_guidance(ORCH_SYSTEM, system), user, plan_schema, check=check, what="subtask plan")
         except PatternError as exc:
-            return {**_ended_with(str(exc)), "subtasks": []}
+            return {**ended_with(str(exc)), "subtasks": []}
         return {"subtasks": d["subtasks"][:max_workers], "work": {},
                 "iteration": int(state.get("iteration", 0)) + 1, "status": None}
 
@@ -546,16 +530,16 @@ def build_orchestrator_workers(*, llm: LLMClient, registry: ToolRegistry,
                             for i, s in enumerate(state["subtasks"]))
         last = state.get("iteration", 0) >= max_rounds
         schema = finish if last else {"anyOf": [finish, more]}
-        system = SYNTH_ORCH_SYSTEM + (SYNTH_FINAL_NOTE if last else "")
+        sys_prompt = with_guidance(SYNTH_ORCH_SYSTEM, system) + (SYNTH_FINAL_NOTE if last else "")
         user = f"Request: {state['query']}\n\nWorker results:\n{summary}"
         def check(d: dict) -> None:
             allowed = ("finish",) if last else ("finish", "more")
             if d.get("decision") not in allowed:
                 raise PatternError(f"decision must be one of {allowed}")
         try:
-            d = ask_json(synth_llm, system, user, schema, what="synthesis", check=check)
+            d = ask_json(synth_llm, sys_prompt, user, schema, what="synthesis", check=check)
         except PatternError as exc:
-            return _ended_with(str(exc))
+            return ended_with(str(exc))
         rnd = {"round": state.get("iteration", 0), "summary": summary}
         if d["decision"] == "finish" or last:
             return {"final": d.get("final", ""), "status": "ok", "history_rounds": [rnd],

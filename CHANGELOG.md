@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased — 하네스: 재시도·검증 (2026-11-13)
+
+검증: pytest 104/104, 조합 행렬 138/138, 어댑터 점검 17/17, docsmith pytest 14/14. `verify` 미지정 시 기존 프롬프트
+438건 중 기존 424건이 순서·내용 그대로 (늘어난 14건은 신규 시나리오).
+
+### Added
+- `OpenAICompatLLM(max_retries=2, backoff=1.0)`: timeout·연결 오류·HTTP 429/5xx를 지수 백오프로 재시도
+  (`Retry-After` 존중, 최대 30초). 다 실패하면 `LLMUnavailableError`. 다른 4xx·컨텍스트 초과는 재시도 안 함.
+  측정: 이전에는 timeout 1회에 react·plan_execute 실행이 그대로 죽었음.
+  SDK 기반 클라이언트(`AnyLLMClient`, `AnthropicLLM`)는 SDK가 같은 재시도를 함
+- `LLMUnavailableError`는 `status=error`로 바꾸지 않고 던짐: 체크포인터가 있으면 `graph.ainvoke(None, config)`로
+  마지막 단계부터 재개되고 끝난 도구는 다시 돌지 않음 (행렬 `llm_outage_resume` ×2)
+- `verify=` (opt-in, react·plan_execute): 최종 답을 코드로 검사. 거절 시 react는 이유를 관찰값으로 돌려 다시
+  추론, plan_execute는 그 이유로 재계획. 상한에서 거절되면 `status=error` (답은 `final`에 남음).
+  `core/contract.py`의 `Verifier`, `verification_failed` (행렬 `verify` ×4)
+
+### Fixed
+- 자식 에이전트의 LLM 장애가 `execute_tool`에서 도구 실패로 기록되어, 부모가 그럴듯한 답으로 **`status=ok` 종료**하던
+  문제 → `LLMUnavailableError`는 다시 던짐 (행렬 `llm_outage_in_child`)
+
+## Unreleased — 리팩터링 (2026-11-13)
+
+### Added
+- **모든 패턴에 `system=`** (도메인 지침): plan_execute(planner·joiner), prompt_chain, router, parallel,
+  evaluator_optimizer(생성·평가), orchestrator_workers(분해·종합). 내장 프롬프트 뒤에 덧붙음
+  (`core/llm.with_guidance`, react와 같은 방식). `None`이면 프롬프트 변화 없음. 행렬 `system_guidance` ×7
+- `agent/prompts.py`: 내장 프롬프트 16개를 한 파일로 (원래 모듈에서도 그대로 import 가능)
+
+검증: pytest 100/100, 조합 행렬 131/131, 어댑터 점검 17/17, docsmith pytest 9/9 + `--demo`. 리팩터링 전후 FakeLLM 프롬프트 411건과 시나리오
+관찰값이 바이트 단위로 같음 (신규 행·신규 시나리오 호출 제외). react `policy=None` 프롬프트 5종도 동일.
+
+### Fixed
+- 컨텍스트 초과(`ContextOverflowError`)로 workflow 패턴 5종(prompt_chain, router, parallel(llm 집계),
+  evaluator_optimizer, orchestrator_workers)과 react compaction 요약이 **실행째 죽던 문제** → `status=error`로 종료.
+  행렬 `wf_overflow` ×5, `ctx_overflow_compaction` 추가
+- workflow 설정의 없는 도구 이름이 실행 중 `ToolError` 크래시 → **build 시점 `ValueError`** (행렬 `wf_unknown_tool` ×5)
+- plan 승인에서 사람이 고친 plan이 잘못되면 크래시 → 거절로 처리, 오류를 재계획 사유로 planner에 전달
+  (행렬 `bad_edited_plan`)
+- `AnthropicLLM`: 컨텍스트 초과를 `ContextOverflowError`로 변환 (다른 클라이언트와 동일). 실제 API로는 확인 안 함
+- `OpenAICompatLLM`: 초과 판정 문구를 `AnyLLMClient`와 같은 목록으로 (전에는 "maximum context length"만)
+- `run.py --state`: 실행은 끝나도 aiosqlite 연결이 안 닫혀 **프로세스가 종료되지 않던 문제** → 연결 닫음
+- `@registry.tool`이 `requires_approval`·`writes`·`output_schema`를 받지 못해 데코레이터 도구에 승인 게이트를 걸 수 없던 문제
+
+### Changed (동작 변화 없음 — 구조만)
+- 모델 출력 파싱·재시도 하나로: `core/llm.py`의 `extract_json`, `ask_parsed`, `OutputError`
+  (react·planner·joiner·workflows에 있던 사본 4개씩 제거, `planner.retry_feedback` 제거)
+- 계약 헬퍼 `core/contract.py`: `ContractState`(각 패턴 state의 기반), `ended_with`, `as_text`, `render_inputs`
+  (plan_execute state에 `result` 채널이 생김)
+- react: `policy=None` 렌더링 분기 제거 → `ContextPolicy()`로 렌더 (`_format_scratchpad`, `OBS_CHAR_LIMIT` 제거;
+  상한 1500자는 `ContextPolicy.inline_chars`)
+- harness 도구 등록부 `HARNESS_TOOLS` (`@_harness`로 추가) + 행렬 `harness_coverage`
+- interrupt payload 타입 상수 `core/hitl.py`: `InterruptType`, `TOOL_APPROVAL` 등 5종
+- `core/llm.py`: `DEFAULT_SAMPLING`, `with_schema_instruction` (클라이언트 2개씩의 사본 통합).
+  `AnthropicLLM`의 스키마 지시 문구가 `AnyLLMClient`의 것으로 바뀜 (프롬프트 변화, 이 클래스 사용처는 0)
+- `run.py`: `_amain`/`_run`의 중복 인자 목록 제거
+
 ## Unreleased — `feat/any-llm-adapter` (2026-11-01)
 ### Added
 - `AnyLLMClient` (mozilla-ai any-llm, 선택 의존성 `any-llm-sdk==1.37.0` 고정): `structured=auto|native|prompt`,

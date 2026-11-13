@@ -28,7 +28,8 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from agent.core import trace
-from agent.core.hitl import approved, feedback_of
+from agent.core.hitl import TOOL_APPROVAL, approved, feedback_of
+from agent.core.llm import LLMUnavailableError
 from agent.core.tools import ToolRegistry
 
 FAILURE_KEY = "__failure__"
@@ -72,7 +73,7 @@ def needs_approval(registry: ToolRegistry, name: str) -> bool:
 
 def approval_payload(name: str, args: dict[str, Any], **extra: Any) -> dict[str, Any]:
     """The ``tool_approval`` interrupt payload (same shape for every pattern)."""
-    return {"type": "tool_approval", "tool": name, "args": args, **extra}
+    return {"type": TOOL_APPROVAL, "tool": name, "args": args, **extra}
 
 
 def record_verdict(name: str, verdict: Any) -> Optional[dict[str, Any]]:
@@ -115,7 +116,9 @@ async def execute_tool(
     Never raises for tool errors (they become a failure result the model can
     react to), but always re-raises ``GraphBubbleUp`` so interrupts raised inside
     the tool -- ``ask_human``, or a nested sub-agent's approval gate -- pause the
-    whole graph instead of being recorded as an error.
+    whole graph instead of being recorded as an error. Also re-raises
+    :class:`~agent.core.llm.LLMUnavailableError` (a sub-agent's model server down):
+    the run stops and can be resumed from its checkpoint, instead of answering around it.
     """
     args = args or {}
     scope = _READ_ONLY.get()
@@ -138,6 +141,10 @@ async def execute_tool(
         value = await registry.call(name, args)
     except GraphBubbleUp:
         raise  # a pause, not an error
+    except LLMUnavailableError:
+        # a model-server outage inside a sub-agent is not a tool failure: recorded as one,
+        # the parent model answered around it and the run ended "ok" with a made-up answer
+        raise
     except Exception as exc:  # noqa: BLE001 -- surface as data the model can react to
         value = failure(f"{type(exc).__name__}: {exc}" + _arg_hint(registry, name, exc))
     trace.emit("tool_call", tool=name, args=trace.clip(args),
