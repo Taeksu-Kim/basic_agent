@@ -32,8 +32,10 @@ from langgraph.types import Send, interrupt
 
 from agent.core import trace
 from agent.core.context import ContextPolicy
+from agent.core.contract import ended_with
 from agent.core.execution import approval_payload, is_failure, needs_approval, record_verdict
-from agent.core.hitl import approved, arun_graph, aresume_graph, feedback_of
+from agent.core.hitl import (LEVEL_REVIEW, PLAN_APPROVAL, TOOL_APPROVALS, approved, arun_graph,
+                             aresume_graph, feedback_of)
 from agent.core.llm import LLMClient
 from agent.core.tools import ToolRegistry
 from agent.plan_execute.dag import Plan, PlanError, substitute_args, topological_levels, validate_plan
@@ -76,6 +78,7 @@ def build_graph(
     approve_plans: bool = False,
     approve_levels: bool = False,
     context_policy: ContextPolicy | None = None,
+    system: str | None = None,
 ) -> Any:
     """Compile the agent graph for a given LLM + tool registry.
 
@@ -97,15 +100,19 @@ def build_graph(
     ``context_policy`` (opt-in) caps each task result shown to the planner (on
     replan) and the joiner at ``inline_chars``; ``None`` keeps the original,
     uncapped prompts. See :mod:`agent.core.context`.
+
+    ``system`` appends domain guidance to the planner's and the joiner's prompt
+    (the built-in protocol prompts stay first; see :mod:`agent.prompts`).
     """
     planner_llm = trace.traced(llm, "plan_execute.planner")
     joiner_llm = trace.traced(llm, "plan_execute.joiner")
 
     def plan_node(state: AgentState) -> dict[str, Any]:
         try:
-            update = planner.plan(state, planner_llm, registry, policy=context_policy)
+            update = planner.plan(state, planner_llm, registry, policy=context_policy,
+                                  system=system)
         except PlanError as exc:  # output stayed unusable after retries -> end the run
-            return {"error": str(exc), "status": "error", "final": "", "plan": [], "levels": [],
+            return {**ended_with(str(exc)), "plan": [], "levels": [],
                     "iteration": int(state.get("iteration", 0)) + 1}
         update["results"] = RESET  # fresh result namespace for the new plan
         update["plan_rejected"] = False
@@ -121,13 +128,19 @@ def build_graph(
 
     def approve_node(state: AgentState) -> dict[str, Any]:
         verdict = interrupt(
-            {"type": "plan_approval", "plan": state["plan"], "levels": state["levels"]}
+            {"type": PLAN_APPROVAL, "plan": state["plan"], "levels": state["levels"]}
         )
         if approved(verdict):
             return {"plan_rejected": False}
         if isinstance(verdict, dict) and verdict.get("plan"):
-            edited = Plan.from_list(verdict["plan"])  # human-substituted plan
-            validate_plan(edited, registry)
+            try:
+                edited = Plan.from_list(verdict["plan"])  # human-substituted plan
+                validate_plan(edited, registry)
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:  # PlanError is a ValueError
+                # an invalid edit used to crash the run; treat it as a rejection and let
+                # the planner see why (same channel as feedback)
+                return {"plan_rejected": True,
+                        "decision_reason": f"human-edited plan is invalid: {exc}"}
             return {
                 "plan_rejected": False,
                 "plan": edited.to_list(),
@@ -168,7 +181,7 @@ def build_graph(
             it = items[0]
             payload = approval_payload(it["tool"], it["args"], thought="", task_id=it["task_id"])
         else:
-            payload = {"type": "tool_approvals", "items": items}
+            payload = {"type": TOOL_APPROVALS, "items": items}
         verdict = interrupt(payload)
         denied: dict[int, Any] = {}
         ok_ids: list[int] = []
@@ -222,7 +235,7 @@ def build_graph(
             results = state.get("results", {}) or {}
             verdict = interrupt(
                 {
-                    "type": "level_review",
+                    "type": LEVEL_REVIEW,
                     "completed_level": cur,
                     "level_results": {tid: results.get(tid) for tid in levels[cur]},
                     "next_level": levels[cur + 1] if cur + 1 < len(levels) else None,
@@ -240,10 +253,10 @@ def build_graph(
 
     def join_node(state: AgentState) -> dict[str, Any]:
         try:
-            update = joiner.join(state, joiner_llm, policy=context_policy,
+            update = joiner.join(state, joiner_llm, policy=context_policy, system=system,
                                  final_round=state.get("iteration", 0) >= max_iterations)
         except PlanError as exc:  # output stayed unusable after retries -> end the run
-            return {"error": str(exc), "status": "error", "final": "", "decision": "error"}
+            return {**ended_with(str(exc)), "decision": "error"}
         if update.get("decision") == "finish":
             update["status"] = "ok"  # contract; a replan that hits the cap leaves it unset -> capped
         return update

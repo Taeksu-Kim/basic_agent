@@ -70,7 +70,10 @@ async def test_async_saver_works_with_ainvoke(tmp_path):
     db = tmp_path / "ckpt.sqlite"
     saver = await open_async_saver(db)
     g = _tiny_graph(saver)
-    out = await g.ainvoke({"x": 0}, {"configurable": {"thread_id": "a"}})
+    try:
+        out = await g.ainvoke({"x": 0}, {"configurable": {"thread_id": "a"}})
+    finally:
+        await saver.conn.close()  # an open aiosqlite connection keeps a worker thread alive
     assert out["x"] == 1
     # same file is readable by the sync saver (shared pruning/inspection path)
     assert list_threads(open_saver(db)) == ["a"]

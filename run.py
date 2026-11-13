@@ -29,7 +29,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.core.checkpoint import open_async_saver, open_saver, prune_threads
 from agent.core.contract import envelope
-from agent.core.hitl import aresume_graph, arun_graph, ask_human, pending_interrupts
+from agent.core.hitl import (LEVEL_REVIEW, PLAN_APPROVAL, TOOL_APPROVAL, TOOL_APPROVALS, aresume_graph,
+                             arun_graph, ask_human, pending_interrupts)
 from agent.core.llm import FakeLLM, OpenAICompatLLM
 from agent.core.tools import ToolRegistry
 from agent.core.trace import Tracer, tracing
@@ -55,18 +56,18 @@ def _prompt_human(payload: dict[str, Any]) -> Any:
     """Render an interrupt payload on the console and collect the verdict."""
     kind = payload.get("type")
     print(f"\n=== paused: {kind} " + "=" * 40)
-    if kind == "plan_approval":
+    if kind == PLAN_APPROVAL:
         print(json.dumps(payload["plan"], indent=2))
         raw = input("approve plan? [y] / feedback to replan: ").strip()
-    elif kind == "level_review":
+    elif kind == LEVEL_REVIEW:
         print(f"level {payload['completed_level']} results:")
         print(json.dumps(payload["level_results"], default=str, indent=2))
         print(f"next level: {payload['next_level']}")
         raw = input("continue? [y] / feedback to replan: ").strip()
-    elif kind == "tool_approval":
+    elif kind == TOOL_APPROVAL:
         print(f"tool: {payload['tool']}  args: {json.dumps(payload['args'], default=str)}")
         raw = input("run this tool? [y] / feedback to deny: ").strip()
-    elif kind == "tool_approvals":  # plan_execute level gate: several tasks, one pause
+    elif kind == TOOL_APPROVALS:  # plan_execute level gate: several tasks, one pause
         decisions = {}
         for item in payload["items"]:
             print(f"task {item['task_id']}: {item['tool']}  "
@@ -136,28 +137,11 @@ def _demo_hitl_llm(agent_type: str) -> FakeLLM:
     )
 
 
-async def _amain(
-    query: str,
-    *,
-    agent_type: str,
-    demo: bool,
-    base_url: str,
-    model: str,
-    approve_plans: bool,
-    approve_levels: bool,
-    state_path: str | None,
-    demo_hitl: bool = False,
-    trace_dir: str | None = None,
-    sampling: dict | None = None,
-    provider: str | None = None,
-    extra_body: dict | None = None,
-) -> None:
+async def _amain(query: str, *, trace_dir: str | None = None, **opts: Any) -> None:
+    """:func:`_run` with tracing on when ``trace_dir`` is given (options: see ``_run``)."""
     tracer = Tracer(Path(trace_dir) / f"{uuid.uuid4().hex[:8]}.jsonl") if trace_dir else None
     with tracing(tracer):
-        await _run(query, agent_type=agent_type, demo=demo, base_url=base_url, model=model,
-                   approve_plans=approve_plans, approve_levels=approve_levels,
-                   state_path=state_path, demo_hitl=demo_hitl, sampling=sampling,
-                   provider=provider, extra_body=extra_body)
+        await _run(query, **opts)
     if tracer is not None:
         print(f"trace: {tracer.path}")
 
@@ -172,7 +156,7 @@ async def _run(
     approve_plans: bool,
     approve_levels: bool,
     state_path: str | None,
-    demo_hitl: bool,
+    demo_hitl: bool = False,
     sampling: dict | None = None,
     provider: str | None = None,
     extra_body: dict | None = None,
@@ -203,14 +187,19 @@ async def _run(
     # NOTE: the graphs run via ainvoke -> the SQLite saver must be the async one.
     saver = await open_async_saver(state_path) if state_path else InMemorySaver()
     thread_id = uuid.uuid4().hex[:8]
-
-    config: dict[str, Any] = {"checkpointer": saver, **wf_config}
-    if approve_plans or approve_levels:
-        if spec.name != "plan_execute":
-            raise SystemExit("--approve-plans / --approve-levels apply to plan_execute only")
-        config.update(approve_plans=approve_plans, approve_levels=approve_levels)
-    graph = spec.build(llm=llm, registry=registry, **config)
-    state = await drive(graph, arun_graph, aresume_graph, query, thread_id)
+    try:
+        config: dict[str, Any] = {"checkpointer": saver, **wf_config}
+        if approve_plans or approve_levels:
+            if spec.name != "plan_execute":
+                raise SystemExit("--approve-plans / --approve-levels apply to plan_execute only")
+            config.update(approve_plans=approve_plans, approve_levels=approve_levels)
+        graph = spec.build(llm=llm, registry=registry, **config)
+        state = await drive(graph, arun_graph, aresume_graph, query, thread_id)
+    finally:
+        if state_path:
+            # an open aiosqlite connection keeps its worker thread alive: with --state the
+            # process finished the run but never exited
+            await saver.conn.close()
 
     env = envelope(state)
     print("pattern:   ", f"{spec.name} ({spec.std_name})")
@@ -223,7 +212,11 @@ async def _run(
 
     if state_path:
         # prune via a sync handle on the same file: keep the 30 most recent threads
-        prune_threads(open_saver(state_path))
+        sync_saver = open_saver(state_path)
+        try:
+            prune_threads(sync_saver)
+        finally:
+            sync_saver.conn.close()
 
 
 _DEMO_SCRIPTS = {"react": _demo_react_llm, "plan_execute": _demo_plan_llm}

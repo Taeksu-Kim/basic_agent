@@ -225,12 +225,23 @@ class ToolRegistry:
         return tool
 
     def tool(
-        self, name: str, *, description: str = "", args_schema: Optional[dict] = None
+        self,
+        name: str,
+        *,
+        description: str = "",
+        args_schema: Optional[dict] = None,
+        requires_approval: bool = False,
+        writes: bool = False,
+        output_schema: Optional[dict] = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator form: ``@registry.tool("search", description=...)``."""
+        """Decorator form of :meth:`register`: ``@registry.tool("search", description=...)``.
+        Takes the same options -- it used to lack ``requires_approval``/``writes``, so a
+        decorated tool could not be approval-gated or refused in read-only sub-agents."""
 
         def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.register(name, fn, description=description, args_schema=args_schema)
+            self.register(name, fn, description=description, args_schema=args_schema,
+                          requires_approval=requires_approval, writes=writes,
+                          output_schema=output_schema)
             return fn
 
         return deco

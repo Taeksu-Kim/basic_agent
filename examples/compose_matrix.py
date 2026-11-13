@@ -25,7 +25,7 @@ from typing import Any, Callable
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from agent.core.context import ContextPolicy, Skill
+from agent.core.context import HARNESS_TOOLS, ContextPolicy, Skill
 from agent.core.contract import envelope
 from agent.core.execution import is_failure
 from agent.core.hitl import ask_human
@@ -881,6 +881,31 @@ async def ctx_overflow_react(rep: Report) -> None:
     rep.add("ctx_overflow_react", "react", "프롬프트 초과 → 죽지 않고 status=error", ok, obs, fix="D9")
 
 
+class CompactOverflowFake(FakeLLM):
+    """compaction 요약 요청만 ContextOverflowError, 그 외에는 큐의 다음 응답."""
+
+    def complete(self, system: str, user: str, *, schema=None) -> str:
+        if system == COMPACT_SYSTEM:
+            raise ContextOverflowError("maximum context length exceeded (fake)")
+        return super().complete(system, user, schema=schema)
+
+
+async def ctx_overflow_compaction(rep: Report) -> None:
+    """compaction 요약 프롬프트가 초과 → 죽지 않고 status=error."""
+    pol = ContextPolicy(compact_at_chars=400, compact_keep_recent=1)
+    llm = CompactOverflowFake(_acts(("small", {"n": 1}), ("small", {"n": 2}), ("small", {"n": 3}),
+                                    ("small", {"n": 4})))
+    try:
+        env = envelope(await start(patterns.get("react").build(
+            llm=llm, registry=_ctx_registry([]), context_policy=pol)))
+        ok = env["status"] == "error" and "context window" in env["error"]
+        obs = f"status={env['status']}, error={_short(env['error'], 50)}"
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("ctx_overflow_compaction", "react+policy", "요약 프롬프트 초과 → 죽지 않고 status=error", ok,
+            obs, fix="D9")
+
+
 async def ctx_joiner_final_round(rep: Report) -> None:
     """재계획 상한 라운드의 joiner 는 finish 만 허용하는 스키마를 받아야 한다."""
     reg = ToolRegistry()
@@ -1001,15 +1026,44 @@ async def cmp_bad_path_ref(rep: Report) -> None:
     rep.add("bad_path_ref", "plan", "없는 경로 참조 → 해당 task 실패, 실행 계속", ok, obs, fix="4B.4")
 
 
-COMPOSE_SCENARIOS = [cmp_read_only_grandchild, cmp_output_schema_ref, cmp_output_schema_missing,
+async def cmp_bad_edited_plan(rep: Report) -> None:
+    """사람이 고친 plan 이 잘못됨 → 크래시 없이 거절로 처리, 오류가 재계획 사유로 planner 에 전달."""
+    reg = ToolRegistry()
+    reg.register("echo", lambda text: text)
+    llm = fake([{"tasks": [{"id": 1, "tool": "echo", "args": {"text": "a"}}]},
+                {"tasks": [{"id": 1, "tool": "echo", "args": {"text": "b"}}]},
+                {"decision": "finish", "final": "ok"}])
+    g = patterns.get("plan_execute").build(llm=llm, registry=reg, checkpointer=InMemorySaver(),
+                                           approve_plans=True)
+    try:
+        await start(g, thread="t")
+        st = await g.ainvoke(Command(resume={"plan": [{"id": 1, "tool": "missing"}]}), _cfg("t"))
+        again = len(pending(st)) == 1 and pending(st)[0].value.get("type") == "plan_approval"
+        told = "missing" in llm.calls[-1][1]  # 두 번째 planner 프롬프트에 오류가 들어감
+        st = await g.ainvoke(Command(resume=True), _cfg("t"))
+        env = envelope(st)
+        ok = again and told and env["status"] == "ok"
+        obs = f"재승인 요청={again}, 사유 전달={told}, status={env['status']}"
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("bad_edited_plan", "plan", "잘못 고친 plan → 거절로 처리 → 재계획 → 승인 → 정상 종료", ok, obs,
+            fix="7")
+
+
+COMPOSE_SCENARIOS = [cmp_bad_edited_plan, cmp_read_only_grandchild, cmp_output_schema_ref, cmp_output_schema_missing,
                      cmp_bad_path_ref]
 
 
 CONTEXT_SCENARIOS = [ctx_offload, ctx_clearing, ctx_compaction, ctx_notes_survive_pause,
                      ctx_skills, ctx_tool_search, ctx_name_clash, ctx_nested_child_policy,
                      ctx_plan_results_cap, ctx_compaction_chain, ctx_read_bad_args,
-                     ctx_overflow_plan, ctx_overflow_react, ctx_joiner_final_round,
+                     ctx_overflow_plan, ctx_overflow_react, ctx_overflow_compaction,
+                     ctx_joiner_final_round,
                      ctx_read_find_and_next]
+
+# harness 도구 -> 그것을 실제로 호출하는 시나리오 (harness_coverage 가 확인)
+HARNESS_SCENARIOS = {"read_observation": ctx_offload, "notes_write": ctx_notes_survive_pause,
+                     "load_skill": ctx_skills, "tool_search": ctx_tool_search}
 
 
 
@@ -1106,6 +1160,76 @@ async def wf_garbage(rep: Report, name: str) -> None:
     except Exception as e:  # noqa: BLE001
         ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
     rep.add("wf_llm_garbage", name, "출력이 깨져도 죽지 않고 status=error", ok, obs, fix="6")
+
+
+async def wf_overflow(rep: Report, name: str) -> None:
+    """모든 LLM 호출이 컨텍스트 초과 → 죽지 않고 status=error (react·plan 과 같은 보장)."""
+    cfg: dict[str, Any] = {
+        "prompt_chain": {"steps": [{"name": "draft", "prompt": "Write about {query}"}]},
+        "router": {"routes": {"echo": "e", "up": "u"}},
+        "parallel": {"sections": [{"name": "only", "tool": "echo"}], "aggregate": "llm"},
+        "evaluator_optimizer": {"criteria": "anything"},
+        "orchestrator_workers": {"workers": ["echo"]},
+    }[name]
+    try:
+        g = patterns.get(name).build(llm=OverflowFake([], limit=10), registry=_wf_registry([]), **cfg)
+        env = envelope(await start(g))
+        ok = env["status"] == "error" and "context window" in env["error"]
+        obs = f"status={env['status']}, error={_short(env['error'], 50)}"
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("wf_overflow", name, "프롬프트 초과 → 죽지 않고 status=error", ok, obs, fix="D9")
+
+
+async def wf_unknown_tool(rep: Report, name: str) -> None:
+    """설정에 없는 도구 이름 → 실행 중 크래시가 아니라 build 시점에 ValueError."""
+    cfg: dict[str, Any] = {
+        "prompt_chain": {"steps": [{"name": "x", "tool": "nope"}]},
+        "router": {"routes": {"echo": "e", "nope": "n"}},
+        "parallel": {"sections": [{"name": "x", "tool": "nope"}]},
+        "evaluator_optimizer": {"criteria": "c", "generator": "nope"},
+        "orchestrator_workers": {"workers": ["echo", "nope"]},
+    }[name]
+    llm = fake([{"route": "nope"}, {"subtasks": [{"worker": "nope", "objective": "go"}]}])
+    try:
+        g = patterns.get(name).build(llm=llm, registry=_wf_registry([]), **cfg)
+    except ValueError as e:
+        ok, obs = "nope" in str(e), f"build ValueError: {_short(str(e), 50)}"
+    else:
+        try:
+            env = envelope(await start(g))
+            ok, obs = False, f"build 통과, 실행 status={env['status']}"
+        except Exception as e:  # noqa: BLE001
+            ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("wf_unknown_tool", name, "없는 도구 이름 → build 시점에 ValueError", ok, obs, fix="7")
+
+
+async def system_guidance(rep: Report) -> None:
+    """모든 패턴: ``system=`` 도메인 지침이 그 패턴의 모든 LLM 호출 system 프롬프트에 붙는다."""
+    guide = "GUIDE-XYZ"
+    cases: dict[str, tuple[list, dict]] = {
+        "react": ([{"action": "finish", "final": "x"}], {}),
+        "plan_execute": ([{"tasks": [{"id": 1, "tool": "echo", "args": {"query": "a"}}]},
+                          {"decision": "finish", "final": "x"}], {}),
+        "prompt_chain": (["out"], {"steps": [{"name": "s", "prompt": "Write about {query}"}]}),
+        "router": ([{"route": "echo"}], {"routes": {"echo": "e"}}),
+        "parallel": (["synth"], {"sections": [{"name": "s", "tool": "echo"}], "aggregate": "llm"}),
+        "evaluator_optimizer": (["draft", {"pass": True, "feedback": "ok"}], {"criteria": "c"}),
+        "orchestrator_workers": ([{"subtasks": [{"worker": "echo", "objective": "go"}]},
+                                  {"decision": "finish", "final": "x"}], {"workers": ["echo"]}),
+    }
+    for name, (script, cfg) in cases.items():
+        llm = fake(script)
+        try:
+            env = envelope(await start(patterns.get(name).build(
+                llm=llm, registry=_wf_registry([]), system=guide, **cfg)))
+            systems = [s for s, _, _ in llm.calls if s != COMPACT_SYSTEM]
+            missing = sum(guide not in s for s in systems)
+            ok = bool(systems) and missing == 0 and env["status"] == "ok"
+            obs = f"LLM 호출 {len(systems)}회, 지침 빠짐 {missing}회, status={env['status']}"
+        except Exception as e:  # noqa: BLE001
+            ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+        rep.add("system_guidance", name, "system= 지침이 모든 LLM 호출에 붙음", ok, obs, fix="8")
 
 
 async def wf_specific(rep: Report) -> None:
@@ -1214,9 +1338,10 @@ async def wf_specific(rep: Report) -> None:
 
 async def run_workflow_scenarios(rep: Report) -> None:
     for name in WORKFLOWS:
-        for sc in (wf_as_child, wf_nested_hitl, wf_garbage):
+        for sc in (wf_as_child, wf_nested_hitl, wf_garbage, wf_overflow, wf_unknown_tool):
             await _guard(rep, sc, name)
     await _guard(rep, wf_specific)
+    await _guard(rep, system_guidance)
 
 
 async def run_all() -> Report:
@@ -1226,6 +1351,10 @@ async def run_all() -> Report:
     missing = sorted(set(patterns.names()) - covered)
     rep.add("registry_coverage", "-", "등록된 모든 패턴에 행렬 어댑터가 있음", not missing,
             f"누락={missing}" if missing else f"{sorted(covered)}", fix="3.3")
+    # 등록된 모든 harness 도구에 그것을 실제로 부르는 시나리오가 있어야 한다
+    h_missing = sorted(set(HARNESS_TOOLS) - set(HARNESS_SCENARIOS))
+    rep.add("harness_coverage", "-", "등록된 모든 harness 도구에 시나리오가 있음", not h_missing,
+            f"누락={h_missing}" if h_missing else f"{sorted(HARNESS_SCENARIOS)}", fix="5")
     for k in PATTERNS:
         for sc in TOP_SCENARIOS:
             await _guard(rep, sc, k)

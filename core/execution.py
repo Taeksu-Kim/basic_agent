@@ -28,7 +28,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from agent.core import trace
-from agent.core.hitl import approved, feedback_of
+from agent.core.hitl import TOOL_APPROVAL, approved, feedback_of
 from agent.core.tools import ToolRegistry
 
 FAILURE_KEY = "__failure__"
@@ -72,7 +72,7 @@ def needs_approval(registry: ToolRegistry, name: str) -> bool:
 
 def approval_payload(name: str, args: dict[str, Any], **extra: Any) -> dict[str, Any]:
     """The ``tool_approval`` interrupt payload (same shape for every pattern)."""
-    return {"type": "tool_approval", "tool": name, "args": args, **extra}
+    return {"type": TOOL_APPROVAL, "tool": name, "args": args, **extra}
 
 
 def record_verdict(name: str, verdict: Any) -> Optional[dict[str, Any]]:
