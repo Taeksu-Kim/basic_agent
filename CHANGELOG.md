@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — 하네스: 재시도·검증 (2026-11-13)
+
+검증: pytest 104/104, 조합 행렬 138/138, 어댑터 점검 17/17, docsmith pytest 14/14. `verify` 미지정 시 기존 프롬프트
+438건 중 기존 424건이 순서·내용 그대로 (늘어난 14건은 신규 시나리오).
+
+### Added
+- `OpenAICompatLLM(max_retries=2, backoff=1.0)`: timeout·연결 오류·HTTP 429/5xx를 지수 백오프로 재시도
+  (`Retry-After` 존중, 최대 30초). 다 실패하면 `LLMUnavailableError`. 다른 4xx·컨텍스트 초과는 재시도 안 함.
+  측정: 이전에는 timeout 1회에 react·plan_execute 실행이 그대로 죽었음.
+  SDK 기반 클라이언트(`AnyLLMClient`, `AnthropicLLM`)는 SDK가 같은 재시도를 함
+- `LLMUnavailableError`는 `status=error`로 바꾸지 않고 던짐: 체크포인터가 있으면 `graph.ainvoke(None, config)`로
+  마지막 단계부터 재개되고 끝난 도구는 다시 돌지 않음 (행렬 `llm_outage_resume` ×2)
+- `verify=` (opt-in, react·plan_execute): 최종 답을 코드로 검사. 거절 시 react는 이유를 관찰값으로 돌려 다시
+  추론, plan_execute는 그 이유로 재계획. 상한에서 거절되면 `status=error` (답은 `final`에 남음).
+  `core/contract.py`의 `Verifier`, `verification_failed` (행렬 `verify` ×4)
+
+### Fixed
+- 자식 에이전트의 LLM 장애가 `execute_tool`에서 도구 실패로 기록되어, 부모가 그럴듯한 답으로 **`status=ok` 종료**하던
+  문제 → `LLMUnavailableError`는 다시 던짐 (행렬 `llm_outage_in_child`)
+
 ## Unreleased — 리팩터링 (2026-11-13)
 
 ### Added

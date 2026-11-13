@@ -32,7 +32,7 @@ from langgraph.types import Send, interrupt
 
 from agent.core import trace
 from agent.core.context import ContextPolicy
-from agent.core.contract import ended_with
+from agent.core.contract import Verifier, ended_with, verification_failed
 from agent.core.execution import approval_payload, is_failure, needs_approval, record_verdict
 from agent.core.hitl import (LEVEL_REVIEW, PLAN_APPROVAL, TOOL_APPROVALS, approved, arun_graph,
                              aresume_graph, feedback_of)
@@ -79,6 +79,7 @@ def build_graph(
     approve_levels: bool = False,
     context_policy: ContextPolicy | None = None,
     system: str | None = None,
+    verify: Verifier | None = None,
 ) -> Any:
     """Compile the agent graph for a given LLM + tool registry.
 
@@ -103,6 +104,10 @@ def build_graph(
 
     ``system`` appends domain guidance to the planner's and the joiner's prompt
     (the built-in protocol prompts stay first; see :mod:`agent.prompts`).
+
+    ``verify`` (opt-in, :data:`agent.core.contract.Verifier`) checks the joiner's final
+    answer in code. A rejection becomes a replan whose reason is the verifier's message;
+    in the last round the run ends with ``status="error"`` (the answer stays in ``final``).
     """
     planner_llm = trace.traced(llm, "plan_execute.planner")
     joiner_llm = trace.traced(llm, "plan_execute.joiner")
@@ -257,6 +262,14 @@ def build_graph(
                                  final_round=state.get("iteration", 0) >= max_iterations)
         except PlanError as exc:  # output stayed unusable after retries -> end the run
             return {**ended_with(str(exc)), "decision": "error"}
+        if update.get("decision") == "finish" and verify is not None:
+            problem = verify(update.get("final", ""), state.get("result"))
+            if problem:
+                why = verification_failed(problem)
+                if state.get("iteration", 0) >= max_iterations:  # no round left: end, keep answer
+                    return {**update, "status": "error", "error": why}
+                trace.emit("verify", passed=False, detail=trace.clip(problem))
+                return {**update, "decision": "replan", "decision_reason": why}
         if update.get("decision") == "finish":
             update["status"] = "ok"  # contract; a replan that hits the cap leaves it unset -> capped
         return update

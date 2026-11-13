@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Callable, Optional, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar("T")
@@ -103,6 +104,25 @@ class ContextOverflowError(RuntimeError):
     (plan_execute joiner with a 60k-char tool result, 2026-11-01)."""
 
 
+class LLMUnavailableError(RuntimeError):
+    """The model server stayed unreachable / overloaded after the client's retries.
+
+    Deliberately *not* turned into ``status=error``: it is an infrastructure failure,
+    not the agent's, and with a checkpointer the run can be resumed from its last
+    completed step (``graph.ainvoke(None, config)``) once the server is back."""
+
+
+TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})  # worth retrying; other 4xx are not
+MAX_RETRY_WAIT = 30.0  # cap on a server-sent Retry-After (seconds)
+
+
+def _retry_after(resp: Any) -> Optional[float]:
+    try:
+        return min(float(resp.headers.get("Retry-After")), MAX_RETRY_WAIT)
+    except (TypeError, ValueError):  # absent, or an HTTP-date we don't parse
+        return None
+
+
 # Server/SDK error texts that mean "context window exceeded" (one list for every client --
 # OpenAICompatLLM used to check only the first one).
 _OVERFLOW_HINTS = ("maximum context length", "context_length_exceeded", "prompt is too long",
@@ -176,12 +196,20 @@ class OpenAICompatLLM:
         api_key: str = "not-needed",
         timeout: float = 120.0,
         sampling: Optional[dict] = None,
+        max_retries: int = 2,
+        backoff: float = 1.0,
     ) -> None:
+        """``max_retries``: extra attempts on a transient failure (timeout, connection
+        error, HTTP 429 / 5xx), waiting ``backoff * 2**i`` seconds (or the server's
+        ``Retry-After``, capped at :data:`MAX_RETRY_WAIT`). The SDK-based clients get the
+        same from their SDK; this one talks HTTP directly, so it has to do it itself."""
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
         self.sampling = {**DEFAULT_SAMPLING, **(sampling or {})}
+        self.max_retries = max_retries
+        self.backoff = backoff
         import threading
 
         self._local = threading.local()  # per-thread: parallel nodes call from several threads
@@ -208,12 +236,28 @@ class OpenAICompatLLM:
                 "type": "json_schema",
                 "json_schema": {"name": "response", "schema": schema, "strict": True},
             }
-        resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=self.timeout,
-        )
+        last = ""
+        for attempt in range(self.max_retries + 1):
+            if attempt:
+                time.sleep(wait)
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=self.timeout,
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last, wait = f"{type(exc).__name__}: {exc}", self.backoff * 2 ** attempt
+                continue
+            if resp.status_code in TRANSIENT_HTTP:
+                last = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                wait = _retry_after(resp) or self.backoff * 2 ** attempt
+                continue
+            break
+        else:
+            raise LLMUnavailableError(
+                f"LLM unreachable after {self.max_retries + 1} attempts: {last}")
         if resp.status_code == 400 and _overflow_text(resp.text):
             raise ContextOverflowError(f"LLM context overflow: {resp.text[:300]}")
         if resp.status_code >= 400:

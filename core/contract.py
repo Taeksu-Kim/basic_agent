@@ -32,7 +32,7 @@ and used as a tool inside any other pattern, and can be driven by the shared
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, Optional, Protocol, TypedDict, runtime_checkable
+from typing import Any, Callable, Literal, Optional, Protocol, TypedDict, runtime_checkable
 
 QUERY, HISTORY, CONTEXT, ITERATION = "query", "history", "context", "iteration"
 FINAL, RESULT, STATUS, ERROR = "final", "result", "status", "error"
@@ -52,6 +52,17 @@ class ContractState(TypedDict, total=False):
     result: Any             # optional structured payload
     status: Optional[str]   # "ok" | "error" when the pattern ends itself; unset at END -> capped
     error: str
+
+
+# A pattern's ``verify=``: checks the final answer in code before the run may end "ok".
+# ``(final, result) -> problem`` -- ``None`` / "" passes; a string says what is wrong and
+# is fed back to the model (react: as an observation; plan_execute: as the replan reason).
+Verifier = Callable[[str, Any], Optional[str]]
+
+
+def verification_failed(problem: str) -> str:
+    """The one wording of a verifier rejection (feedback to the model and ``error``)."""
+    return f"final answer failed verification: {problem}"
 
 
 def ended_with(error: str) -> dict[str, Any]:

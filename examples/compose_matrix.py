@@ -29,7 +29,7 @@ from agent.core.context import HARNESS_TOOLS, ContextPolicy, Skill
 from agent.core.contract import envelope
 from agent.core.execution import is_failure
 from agent.core.hitl import ask_human
-from agent.core.llm import ContextOverflowError, FakeLLM
+from agent.core.llm import ContextOverflowError, FakeLLM, LLMUnavailableError
 from agent.core.tools import AgentTool, ToolRegistry
 from agent.patterns import registry as patterns
 from agent.plan_execute.orchestrator.joiner import FINISH_ONLY_SCHEMA, JOINER_SYSTEM
@@ -906,6 +906,98 @@ async def ctx_overflow_compaction(rep: Report) -> None:
             obs, fix="D9")
 
 
+class OutageFake(FakeLLM):
+    """``down_at``번째 호출(1부터)에서 LLMUnavailableError — 서버가 재시도 끝에도 응답 없음."""
+
+    def __init__(self, responses: list[str], down_at: int) -> None:
+        super().__init__(responses)
+        self.down_at, self.n = down_at, 0
+
+    def complete(self, system: str, user: str, *, schema=None) -> str:
+        self.n += 1
+        if self.n == self.down_at:
+            raise LLMUnavailableError("LLM unreachable after 3 attempts: HTTP 503 (fake)")
+        return super().complete(system, user, schema=schema)
+
+
+async def llm_outage_resume(rep: Report) -> None:
+    """LLM 장애로 실행이 예외로 끝남 → 체크포인트에서 재개 → 끝난 도구는 다시 안 돌고 정상 종료."""
+    for pk, script, down_at in (
+        ("react", _acts(("work", {})), 2),
+        ("plan_execute", [json.dumps({"tasks": [{"id": 1, "tool": "work", "args": {}}]}),
+                          json.dumps({"decision": "finish", "final": "done"})], 2),
+    ):
+        log: list = []
+        reg = ToolRegistry()
+        reg.register("work", lambda: log.append("work") or "W")
+        g = patterns.get(pk).build(llm=OutageFake(script, down_at), registry=reg,
+                                   checkpointer=InMemorySaver())
+        try:
+            raised = False
+            try:
+                await start(g, thread="t")
+            except LLMUnavailableError:
+                raised = True
+            st = await g.ainvoke(None, _cfg("t"))  # server back: resume from the checkpoint
+            env = envelope(st)
+            ok = raised and env["status"] == "ok" and log.count("work") == 1
+            obs = f"예외={raised}, 재개 후 status={env['status']}, 도구 {log.count('work')}회"
+        except Exception as e:  # noqa: BLE001
+            ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+        rep.add("llm_outage_resume", pk, "LLM 장애 → 예외 → 체크포인트에서 재개, 도구 재실행 없음", ok, obs,
+                fix="H1")
+
+
+async def llm_outage_in_child(rep: Report) -> None:
+    """자식 에이전트의 LLM 장애는 '도구 실패'가 아니다 → 부모가 그럴듯한 답으로 ok 종료하면 안 되고 예외로 멈춤."""
+    child = patterns.get("react").build(llm=OutageFake([], 1), registry=ToolRegistry())
+    reg = ToolRegistry()
+    reg.add(AgentTool("kid", child, description="sub-agent"))
+    parent = patterns.get("react").build(
+        llm=fake(_acts(("kid", {"query": "go"}), final="made-up answer")), registry=reg)
+    try:
+        env = envelope(await start(parent))
+        ok, obs = False, f"예외 없음, status={env['status']}, final={env['final']!r}"
+    except LLMUnavailableError as e:
+        ok, obs = True, _short(f"LLMUnavailableError: {e}", 60)
+    except Exception as e:  # noqa: BLE001
+        ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+    rep.add("llm_outage_in_child", "react⊃react", "자식 LLM 장애 → 부모도 예외로 멈춤 (가짜 성공 금지)", ok, obs,
+            fix="H1")
+
+
+def _must_say_good(final: str, result: Any) -> str | None:
+    return None if final == "good" else f"answer must be 'good', got {final!r}"
+
+
+async def verify_recovers(rep: Report) -> None:
+    """verify= 가 첫 답을 거절 → 이유가 모델에 전달 → 고친 답으로 ok. 상한에 걸리면 status=error."""
+    reg = ToolRegistry()
+    reg.register("work", lambda: "W")
+    finish = lambda f: json.dumps({"action": "finish", "final": f})  # noqa: E731
+    plan = json.dumps({"tasks": [{"id": 1, "tool": "work", "args": {}}]})
+    join = lambda f: json.dumps({"decision": "finish", "final": f})  # noqa: E731
+    cases = [  # (pattern, script, cap config, expect status, expect final)
+        ("react", [finish("bad"), finish("good")], {}, "ok", "good"),
+        ("react", [finish("bad")], {"max_steps": 1}, "error", "bad"),
+        ("plan_execute", [plan, join("bad"), plan, join("good")], {}, "ok", "good"),
+        ("plan_execute", [plan, join("bad")], {"max_iterations": 1}, "error", "bad"),
+    ]
+    for pk, script, cap, want_status, want_final in cases:
+        llm = FakeLLM(script)
+        try:
+            env = envelope(await start(patterns.get(pk).build(llm=llm, registry=reg,
+                                                               verify=_must_say_good, **cap)))
+            told = any("answer must be 'good'" in u for _, u, _ in llm.calls[1:])
+            ok = (env["status"] == want_status and env["final"] == want_final
+                  and (told if want_status == "ok" else "verification" in env["error"]))
+            obs = f"status={env['status']}, final={env['final']!r}, 이유 전달={told}, error={_short(env['error'], 40)}"
+        except Exception as e:  # noqa: BLE001
+            ok, obs = False, _short(f"CRASH {type(e).__name__}: {e}")
+        what = "거절 → 이유 전달 → 고친 답으로 ok" if want_status == "ok" else "상한에서 거절 → status=error"
+        rep.add("verify", f"{pk}{' cap' if cap else ''}", what, ok, obs, fix="H2")
+
+
 async def ctx_joiner_final_round(rep: Report) -> None:
     """재계획 상한 라운드의 joiner 는 finish 만 허용하는 스키마를 받아야 한다."""
     reg = ToolRegistry()
@@ -1057,7 +1149,8 @@ COMPOSE_SCENARIOS = [cmp_bad_edited_plan, cmp_read_only_grandchild, cmp_output_s
 CONTEXT_SCENARIOS = [ctx_offload, ctx_clearing, ctx_compaction, ctx_notes_survive_pause,
                      ctx_skills, ctx_tool_search, ctx_name_clash, ctx_nested_child_policy,
                      ctx_plan_results_cap, ctx_compaction_chain, ctx_read_bad_args,
-                     ctx_overflow_plan, ctx_overflow_react, ctx_overflow_compaction,
+                     ctx_overflow_plan, ctx_overflow_react, ctx_overflow_compaction, llm_outage_resume,
+                     llm_outage_in_child, verify_recovers,
                      ctx_joiner_final_round,
                      ctx_read_find_and_next]
 
